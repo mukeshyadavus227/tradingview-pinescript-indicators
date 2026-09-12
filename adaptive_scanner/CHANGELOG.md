@@ -5,6 +5,30 @@ on every symbol — TradingView snapshots the script at alert-creation time.
 Bump `schema_version` in the payload alongside any such change so the server's
 version floor can reject alerts that were not re-created.
 
+## 2.0.0-phase2 — validation harness and findings
+
+No change to emitted values except the R:R fix below. **Alerts must be re-created
+for the R:R fix.**
+
+### Added
+- `asr_engine_bt.pine` — `strategy()` twin, generated from the indicator by
+  `research/build_twin.py` so the math is the same text.
+- `research/` — Python mirror, labeller, event builder, analysis, parity test,
+  48-symbol daily dataset. See `PHASE2_FINDINGS.md`.
+
+### Fixed (found by the harness)
+- **R:R gate was structurally incompatible with the strategies' own geometry.**
+  SWING's 2.0 gate excluded S3 (designed 1.67) and S4 (1.6) outright — SPY had
+  one signal in twelve years. POSITIONAL scaled the stop without the target,
+  pushing S3 to 0.9. Gate default is now 1.5 for both profiles and the target
+  scales with the profile alongside the stop.
+
+### Findings (see PHASE2_FINDINGS.md for the numbers)
+- Score predicts outcome for S4 only. S1/S2/S3 scores are noise.
+- S1's regime gate discards 99.8% of the study's strongest trigger edge.
+- S2 has no edge.
+- Time-stop exits are the profitable ones; exit design is the largest lever.
+
 ## 2.0.0-phase1 — Adaptive Scanner Engine
 
 Rewrite of `Adaptive Swing Scanner v1.0`. Phase 1 of the plan: correctness and

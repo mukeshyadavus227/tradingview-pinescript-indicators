@@ -120,7 +120,7 @@ components, not to size on them.
 |---|---|---|
 | Entry timeframe | 4H | 1D |
 | Min conviction | 75 | 70 |
-| Min R:R | 2.0 | 3.0 |
+| Min R:R | 1.5 | 1.5 |
 | ATR stop multiple | 1.5 | 2.75 |
 | Cooldown | 7200 min (5 days) | 21600 min (15 trading days) |
 | Time-stop horizon | 15 days | 60 days |
@@ -194,17 +194,45 @@ regressions nothing else will.
 
 ---
 
+## Phase 2 — validation (done)
+
+`research/` holds the validation harness and its results. Read
+`PHASE2_FINDINGS.md` first; it is the kill/keep decision document. Summary:
+
+- The conviction score predicts outcome for **S4 only** (Spearman +0.063,
+  holds out of sample). For S1/S2/S3 it is noise.
+- **S1's trigger is the strongest edge in the study** (+0.25 R, n=3,516) and
+  the regime gate discarded 99.8% of it — 84% of S1 triggers occur in the
+  BREAKOUT regime, which the gate blocks. S1 in an uptrend: +0.47 R.
+- **S2 has no edge. Kill.**
+- **Half of deployed trades exit on the time stop, and those are the profitable
+  ones** (+0.39 R vs +0.15 overall; 43% touched +1 R and gave it back). The
+  exit, not the entry, is the biggest lever.
+- DSR 0.66–0.79 at the enumerated 56 configurations, 0.22 at an honest N=500;
+  PBO 0.06–0.20.
+
+```
+research/
+  pine_ta.py        exact Pine ta.* reimplementations (RMA seeding, biased stdev, DMI, ...)
+  engine.py         Python mirror of asr_engine.pine on daily bars
+  labels.py         triple-barrier labels with TradingView's broker-emulator fill rule
+  build_events.py   one row per (symbol, bar, strategy, direction) trigger event → out/events_*.csv
+  analysis.py       decile curves, walk-forward, regime matrix, ablation, DSR, PBO/CSCV → out/report_*.md
+  parity_test.py    Strategy Tester export vs sequential replay — the gate on everything above
+  build_twin.py     generates asr_engine_bt.pine from asr_engine.pine (text transform = parity by construction)
+  data/             48 symbols × 3000 daily bars (TradingView, split-adjusted)
+```
+
+Reproduce: `pip install -r research/requirements.txt && cd research && python build_events.py && python analysis.py`.
+Regenerate the twin after any engine edit: `python research/build_twin.py` (`--check` to verify it is current).
+
 ## What is not built yet
 
-Phase 2 (validation) is the gate on everything downstream:
+The parity gate has not yet been run — it needs a Strategy Tester export from
+a TradingView account (`research/parity_test.py` explains how).
 
-- `asr_engine_bt.pine` — the `strategy()` twin, identical math.
-- `research/parity_test.py` — Pine trade list vs Python replay, ≥99% match.
-  **Nothing from the walk-forward is trustworthy until this passes.**
-- `research/wf.py` — walk-forward, expectancy by strategy × regime × score
-  decile, ablation baseline, deflated Sharpe, PBO via CSCV.
-
-Phase 3 adds the LONGTERM profile, Phase 5 the intraday profiles, and a separate
+Phase 3 implements the Phase 2 decisions (exits first, S1 rewrite, S2 removal,
+regime to metadata), then adds the LONGTERM profile, Phase 5 the intraday profiles, and a separate
 `asr_rotation_403b.pine` handles the retirement sleeve — that one is
 cross-sectional over ~20 ETFs and emits portfolio weights rather than per-symbol
 entries, so it cannot share this engine's per-chart topology.
