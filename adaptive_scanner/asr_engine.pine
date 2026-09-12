@@ -1,0 +1,1002 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mukeshyadavus
+
+//@version=6
+indicator("Adaptive Scanner Engine", "ASR", overlay = true,
+     max_labels_count = 100, max_lines_count = 100, max_bars_back = 1000)
+
+// ============================================================================
+// ADAPTIVE SCANNER ENGINE  v2.0.0-phase1
+// Successor to "Adaptive Swing Scanner v1.0".
+//
+// PHASE 1 SCOPE — correctness + payload repair only.
+//   Profiles shipped:  SWING, POSITIONAL
+//   Profiles deferred: INTRADAY_15M / INTRADAY_5M (Phase 5, needs S5 ORB +
+//                      S6 VWAP-reclaim + time-of-day RVOL), LONGTERM (Phase 3,
+//                      needs S9 fundamentals + S10 monthly overlay)
+//   Deliberately NOT shipped: score-driven position sizing. See CONFIDENCE.
+//
+// WHAT CHANGED FROM v1.0 (every item is a defect fix, not a feature)
+//   [F1] Payload reached the server stripped. v1 nested stop/target/scores in
+//        objects the TVSignal model does not declare, so they were dropped in
+//        transit and orders went out as bare MKT with stop=0. v2 writes the
+//        stop into the top-level `stop` field and a structured digest into
+//        `comment` — both fields the CURRENT server already accepts — while
+//        also emitting the full v2 JSON for the patched server. The bracket
+//        now survives an unpatched server.
+//   [F2] `confidence` is now emitted. The executor sizes on it; v1 never sent
+//        it, so every signal silently took the 1.5%-NAV default and the whole
+//        scoring engine had zero effect on capital at risk.
+//   [F3] shortEnabled=false no longer suppresses the bar. v1 compared long vs
+//        short BEFORE filtering to enabled directions, so a stronger short
+//        killed a valid long outright. Direction filtering now precedes argmax.
+//   [F4] ATR percentile divided by a hardcoded 252 with no valid-bar guard,
+//        understating the percentile during warmup and inflating composite
+//        score on short-history symbols. Denominator is now the observed count.
+//   [F5] HTF repaint. v1 used request.security(...,"W",expr) with no lookahead,
+//        which returns the last CONFIRMED weekly bar in history but the FORMING
+//        one in realtime — S1/S4 flipped between backtest and live. Now
+//        expr[1] + lookahead_on, which is identical in both.
+//   [F6] Warmup gate. Regime needs ~70 bars and the percentiles 252 daily bars.
+//        v1 emitted confident-looking output before either was satisfied.
+//   [F7] R:R was computed and never enforced. S2's channel-derived stop can
+//        produce R:R < 1. Now a hard gate.
+//   [F8] Stop/target prices are rounded to syminfo.mintick BEFORE the R:R gate,
+//        so the gate tests the price that will actually be worked.
+//   [F9] Score comparability. v1 gave S2 a 30-point base for merely triggering
+//        (effective floor ~45) while S1 had to earn every point, biasing winner
+//        selection toward breakouts. All four are now scored against one
+//        five-component rubric and THE TRIGGER IS A BOOLEAN GATE WORTH ZERO.
+//  [F10] Day-scale context (SMA200, 52wk range, ADV$, ROC, ATR percentile,
+//        12-1 momentum) now comes from a daily request.security context rather
+//        than chart-timeframe bar counts, so `roc_20d` means 20 days on every
+//        timeframe instead of 77 minutes on a 5m chart.
+//  [F11] Fictional position tracking removed. v1 mirrored broker state it could
+//        not see and resolved same-bar SL/TP hits ambiguously. The engine now
+//        reports only what it last EMITTED, labelled as reference levels.
+//  [F12] Hardcoded `hour == 13` gate replaced by a session-relative gate that
+//        works on any timeframe and survives bar-alignment changes.
+//  [F13] Cooldown is measured in minutes of wall-clock, not bars. The same
+//        input meant 75 minutes on 5m and 3 weeks on daily.
+//
+// STILL UNVALIDATED (Phase 2 blocks on this)
+//   The rubric weights below are hand-assigned and have NOT been tested against
+//   forward returns. Until the strategy() twin produces an expectancy-by-decile
+//   curve per strategy per regime, treat the score as a ranking hint only —
+//   which is exactly why useScoreConfidence defaults to OFF.
+//
+// DEPLOYMENT
+//   Alert condition: "Any alert() function call"
+//   Webhook URL:     https://<host>/webhook?token=<TV_WEBHOOK_TOKEN>
+//   Message:         leave empty — alert() supplies the payload
+//   NOTE: TradingView snapshots the script at alert-creation time. Any edit to
+//   this file requires re-creating every alert. The server should reject any
+//   payload whose schema_version is below its floor so stale alerts surface.
+// ============================================================================
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                              PROFILE                                     ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+enum Profile
+    SWING      = "SWING — 4H/1D, days to weeks"
+    POSITIONAL = "POSITIONAL — 1D/1W, weeks to months"
+
+profile     = input.enum(Profile.SWING, "Profile", group = "Profile",
+     tooltip = "Selects the parameter set. INTRADAY and LONGTERM profiles ship in Phase 5 / Phase 3 respectively — they need sub-strategies that do not exist yet, and shipping them as parameter tweaks of the swing engine would be dishonest.")
+isSwing     = profile == Profile.SWING
+profileStr  = isSwing ? "SWING" : "POSITIONAL"
+
+// Profile-resolved defaults. Operator overrides live in the groups below.
+p_minScore      = isSwing ?  75.0 :  70.0
+p_cooldownMin   = isSwing ?  7200 : 21600     // 5 days vs 15 trading days
+p_minRR         = isSwing ?   2.0 :   3.0
+p_atrStopMult   = isSwing ?   1.5 :   2.75
+p_timeStopDays  = isSwing ?    15 :    60
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                           MASTER CONTROLS                                ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+minScore        = input.float(0.0, "Min Conviction Score (0 = use profile default)",
+     minval = 0.0, maxval = 95.0, step = 1.0, group = "Master Controls")
+shortEnabled    = input.bool(false, "Enable Short Signals", group = "Master Controls")
+useRegimeFilter = input.bool(true, "Enforce Regime-Strategy Alignment", group = "Master Controls")
+cooldownMin     = input.int(0, "Cooldown (minutes, 0 = profile default)", minval = 0,
+     group = "Master Controls",
+     tooltip = "Wall-clock, not bars. v1 used bars, which meant 75 minutes on a 5m chart and three weeks on a daily chart from the same input.")
+minRR           = input.float(0.0, "Minimum R:R to fire (0 = profile default)",
+     minval = 0.0, maxval = 6.0, step = 0.1, group = "Master Controls",
+     tooltip = "v1 computed rrRatio and never enforced it. S2's channel-derived stop can produce R:R below 1.")
+
+effMinScore  = minScore    > 0.0 ? minScore    : p_minScore
+effCooldown  = cooldownMin > 0   ? cooldownMin : p_cooldownMin
+effMinRR     = minRR       > 0.0 ? minRR       : p_minRR
+
+// ── Session gating (replaces the hardcoded 13:00 NY check) ──────────────────
+useSessionGate = input.bool(true, "Restrict firing to a session window", group = "Session Gate",
+     tooltip = "v1 hardcoded `hour == 13`, valid only for 4H US-equity charts. On a 5m chart it fired exactly once a day at 13:00. Turn OFF for futures, FX, or 1D+ charts where every confirmed close is actionable.")
+gateSession    = input.session("0930-1600", "Tradeable session (exchange time)", group = "Session Gate")
+fireOnLastBar  = input.bool(false, "Fire only on the session's last bar", group = "Session Gate",
+     tooltip = "For end-of-day decision making on intraday charts. Ignored on 1D and higher.")
+noEntryAfter   = input.int(0, "Block entries after this hour (exchange time, 0 = off)",
+     minval = 0, maxval = 23, group = "Session Gate")
+
+// ── Confidence → position size ──────────────────────────────────────────────
+// The executor sizes on `confidence`: >=0.8 -> 2.0% NAV, 0.6-0.8 -> 1.5%,
+// <0.6 -> 1.0%, and rejects below 0.3. v1 emitted no confidence at all, so
+// every signal took the unset default of 1.5%.
+//
+// Phase 1 deliberately restores that 1.5% behaviour EXACTLY (constant 0.6)
+// rather than letting an unvalidated score drive real position size. Turn
+// useScoreConfidence ON only after Phase 2 shows expectancy is monotone in
+// score. That is the whole point of the sequencing.
+useScoreConfidence = input.bool(false, "Derive confidence from score (REQUIRES Phase 2 validation)",
+     group = "Confidence",
+     tooltip = "OFF = emit a constant 0.6, reproducing today's flat 1.5%-NAV sizing. ON = map score linearly onto the confidence band, which makes an unvalidated rubric decide how much money is at risk. Do not turn this on before the expectancy-by-decile curve exists.")
+confFlat     = input.float(0.60, "Flat confidence when derivation is OFF",
+     minval = 0.31, maxval = 0.99, step = 0.01, group = "Confidence")
+confAtMin    = input.float(0.45, "Confidence at min score", minval = 0.30, maxval = 0.95, step = 0.01, group = "Confidence")
+confAtMax    = input.float(0.95, "Confidence at score 100", minval = 0.35, maxval = 1.00, step = 0.01, group = "Confidence")
+
+// ── Display ─────────────────────────────────────────────────────────────────
+showRegimeBG   = input.bool(false, "Regime background", group = "Display")
+showStratLabel = input.bool(false, "Strategy name on signals", group = "Display")
+showLevels     = input.bool(true,  "Reference SL/TP lines for last emitted signal", group = "Display")
+showDash       = input.bool(true,  "Dashboard", group = "Display")
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                        INDICATOR PARAMETERS                              ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// These are CHART-TIMEFRAME lengths and are meant to be. ADX(14) on a 4H chart
+// is a legitimate 4H trend measure. What must NOT be chart-timeframe is the
+// day-scale context (SMA200, 52wk range, ADV$, ROC-in-days, ATR percentile);
+// that now comes from the daily context block below. See [F10].
+adxLen      = input.int(14, "ADX Length",        minval = 7,  maxval = 30, group = "Regime Detection")
+adxTrendThr = input.int(25, "ADX Trending",      minval = 15, maxval = 40, group = "Regime Detection")
+adxRangeThr = input.int(20, "ADX Range-Bound",   minval = 10, maxval = 25, group = "Regime Detection")
+chopLen     = input.int(14, "Choppiness Length", minval = 5,  maxval = 30, group = "Regime Detection")
+bbwLen      = input.int(20, "BB Width Length",   minval = 10, maxval = 50, group = "Regime Detection")
+bbwStd      = input.float(2.0, "BB Width StdDev", minval = 1.0, maxval = 3.0, step = 0.5, group = "Regime Detection")
+
+s1_rsiLen     = input.int(14, "S1: RSI Length",      minval = 2,  maxval = 50, group = "S1 Mean Reversion")
+s1_oversold   = input.int(30, "S1: Oversold",        minval = 10, maxval = 45, group = "S1 Mean Reversion")
+s1_overbought = input.int(70, "S1: Overbought",      minval = 55, maxval = 90, group = "S1 Mean Reversion")
+s1_supportLen = input.int(20, "S1: Support Lookback", minval = 5, maxval = 60, group = "S1 Mean Reversion")
+
+s2_entryLen = input.int(20, "S2: Entry Channel",     minval = 5,  maxval = 55,  group = "S2 Donchian Breakout")
+s2_trendSMA = input.int(50, "S2: Trend SMA",         minval = 20, maxval = 200, group = "S2 Donchian Breakout")
+s2_volMult  = input.float(1.3, "S2: Volume Spike x", minval = 1.0, maxval = 2.0, step = 0.1, group = "S2 Donchian Breakout")
+
+s3_fastEMA  = input.int(9,  "S3: Fast EMA",  minval = 3,  maxval = 30,  group = "S3 EMA/VWAP Momentum")
+s3_slowEMA  = input.int(21, "S3: Slow EMA",  minval = 10, maxval = 50,  group = "S3 EMA/VWAP Momentum")
+s3_trendEMA = input.int(50, "S3: Trend EMA", minval = 30, maxval = 200, group = "S3 EMA/VWAP Momentum")
+s3_macdFast = input.int(12, "S3: MACD Fast",   minval = 5,  maxval = 20, group = "S3 EMA/VWAP Momentum")
+s3_macdSlow = input.int(26, "S3: MACD Slow",   minval = 15, maxval = 40, group = "S3 EMA/VWAP Momentum")
+s3_macdSig  = input.int(9,  "S3: MACD Signal", minval = 3,  maxval = 15, group = "S3 EMA/VWAP Momentum")
+s3_crossMax = input.int(5,  "S3: Max bars since cross", minval = 1, maxval = 20, group = "S3 EMA/VWAP Momentum")
+
+s4_wkFast   = input.int(20, "S4: Weekly Fast EMA", minval = 5,  maxval = 50,  group = "S4 Multi-TF Trend")
+s4_wkSlow   = input.int(50, "S4: Weekly Slow EMA", minval = 20, maxval = 100, group = "S4 Multi-TF Trend")
+s4_dailyEMA = input.int(21, "S4: Entry EMA",       minval = 5,  maxval = 50,  group = "S4 Multi-TF Trend")
+s4_rsiPBLo  = input.int(40, "S4: Pullback Buy Zone",  minval = 25, maxval = 50, group = "S4 Multi-TF Trend")
+s4_rsiPBHi  = input.int(60, "S4: Pullback Sell Zone", minval = 50, maxval = 75, group = "S4 Multi-TF Trend")
+
+atrLen       = input.int(14, "ATR Length (chart TF)", minval = 5, maxval = 30, group = "Risk")
+atrStopMult  = input.float(0.0, "ATR Stop Multiple (0 = profile default)",
+     minval = 0.0, maxval = 6.0, step = 0.25, group = "Risk")
+minDollarVol = input.float(5.0, "Min 20-DAY Avg Dollar Volume ($M)", minval = 0.0, maxval = 500.0, step = 1.0,
+     group = "Risk",
+     tooltip = "Twenty DAYS, sourced from the daily context — not twenty chart bars. v1 used volSMA20*close on the chart timeframe, which on a 5m chart measured 100 minutes of volume.")
+minPrice     = input.float(5.0, "Min Price", minval = 0.0, step = 0.5, group = "Risk")
+
+effAtrStop = atrStopMult > 0.0 ? atrStopMult : p_atrStopMult
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                    TIMEFRAME NORMALIZATION LAYER                         ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// Every quantity expressed in DAYS must resolve to the same thing on 5m, 15m,
+// 4H, 1D and 1W. Two mechanisms:
+//   1. bpd (bars per trading day) converts day-counts into chart bars for the
+//      few chart-timeframe things that are genuinely day-scaled (time stops).
+//   2. The daily context block supplies everything with a lookback beyond
+//      ~60 trading days, because those are either meaningless or literally
+//      uncomputable on the chart timeframe. 252 daily bars at 5m would need
+//      19,656 bars of history, past Pine's 5,000-bar ceiling.
+sessionSec = input.int(23400, "Trading seconds per session", minval = 3600, maxval = 86400,
+     group = "Timeframe Normalization",
+     tooltip = "23400 = 6.5h US equity RTH. 57600 for extended hours. ~82800 for most futures. Used to convert day-counts into chart bars.")
+
+tfSec = timeframe.in_seconds(timeframe.period)
+bpd   = timeframe.isintraday ? math.max(1.0, math.round(sessionSec / math.max(1.0, tfSec))) :
+        timeframe.isdaily    ? 1.0 :
+        timeframe.isweekly   ? 0.2 :
+        timeframe.ismonthly  ? 1.0 / 21.0 : 1.0
+
+// Diagnostic: count bars actually observed per session and compare to the
+// formula. A large divergence means sessionSec is wrong for this instrument
+// (half-days, extended hours toggled, non-US session) and every day-scaled
+// quantity is off. Emitted in the payload rather than silently absorbed.
+var int   barsThisSess = 0
+var float bpdObs       = na
+var int   sessSeen     = 0
+if timeframe.isintraday
+    barsThisSess += 1
+    if session.islastbar and barstate.isconfirmed
+        bpdObs       := na(bpdObs) ? barsThisSess : bpdObs + 0.2 * (barsThisSess - bpdObs)
+        sessSeen     += 1
+        barsThisSess := 0
+bpdDrift = timeframe.isintraday and sessSeen >= 5 and not na(bpdObs) ? math.abs(bpdObs - bpd) / bpd * 100.0 : 0.0
+
+// Used by the Phase 5 intraday profile to express time stops and opening-range
+// windows in days/minutes rather than bars. Kept here so the normalization
+// layer has one owner.
+barsForDays(float days) => math.max(1, int(math.round(days * bpd)))
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                          DAILY CONTEXT  [F10]                            ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// One tuple-returning request.security call carries every day-scale feature.
+// Tuple returns count as a single call against the 40-per-script budget.
+//
+// bpy = bars per year on whichever timeframe the context is computed. On an
+// intraday chart the context is pulled from "D" so bpy = 252. On a 1D+ chart
+// we compute it locally on the chart timeframe (requesting a LOWER timeframe
+// than the chart with lookahead_on would be genuine forward-looking bias), so
+// bpy scales to 252 / 52 / 12.
+// On an intraday chart the context is pulled from "D". On 1D and above it is
+// pulled from the chart's own timeframe, because requesting a LOWER timeframe
+// than the chart with lookahead_on is genuine forward-looking bias. Either way
+// the context is the last CONFIRMED bar of ctxTf, so on a 1D chart the context
+// is as of yesterday's close. That lag is deliberate: it is what makes the
+// values identical in backtest and in realtime.
+ctxFromDaily = tfSec < 86400
+ctxBpy       = ctxFromDaily        ? 252 :
+               timeframe.isweekly  ? 52  :
+               timeframe.ismonthly ? 12  : 252
+
+f_ctx(simple int bpy) =>
+    nAtr = math.max(2, int(math.round(bpy / 18.0)))    // ~14 days
+    nAdv = math.max(2, int(math.round(bpy / 12.6)))    // ~20 days
+    n50  = math.max(2, int(math.round(bpy / 5.04)))    // ~50 days
+    n200 = math.max(2, int(math.round(bpy / 1.26)))    // ~200 days
+    n1m  = math.max(1, int(math.round(bpy / 12.6)))    // ~20 days
+    n3m  = math.max(1, int(math.round(bpy / 4.2)))     // ~60 days
+    n6m  = math.max(1, int(math.round(bpy / 2.0)))     // ~126 days
+    n12m = math.max(2, bpy)
+
+    _atr  = ta.atr(nAtr)
+    _rsi  = ta.rsi(close, 14)
+    [_dp, _dm, _adx] = ta.dmi(14, 14)
+    _s50  = ta.sma(close, n50)
+    _s200 = ta.sma(close, n200)
+    _adv  = ta.sma(volume, nAdv) * close
+    _hi   = ta.highest(high, n12m)
+    _lo   = ta.lowest(low,  n12m)
+    _r1   = close[n1m] > 0 ? (close - close[n1m]) / close[n1m] * 100.0 : na
+    _r2   = close[n3m] > 0 ? (close - close[n3m]) / close[n3m] * 100.0 : na
+    _r3   = close[n6m] > 0 ? (close - close[n6m]) / close[n6m] * 100.0 : na
+    // 12-1 momentum: twelve-month return excluding the most recent month, the
+    // standard construction that strips short-term reversal.
+    _m121 = close[n12m] > 0 and not na(close[n1m]) ? (close[n1m] / close[n12m] - 1.0) * 100.0 : na
+
+    // [F4] ATR percentile against the number of bars ACTUALLY observed, not a
+    // hardcoded 252. v1's fixed denominator understated the percentile during
+    // warmup and on short-history symbols, which inflated composite score via
+    // the (100 - atrPctile) term and pushed new listings to the top of the rank.
+    _atrPrev = _atr[1]
+    _seen = 0
+    _cnt  = 0
+    for i = 2 to n12m + 1
+        if not na(_atr[i]) and not na(_atrPrev)
+            _seen += 1
+            if _atrPrev > _atr[i]
+                _cnt += 1
+    _atrP = _seen >= 20 ? _cnt / _seen * 100.0 : na
+
+    _gap  = close[1] > 0 ? (open - close[1]) / close[1] * 100.0 : na
+    _abs  = math.abs(nz(_gap))
+    _gapA = ta.sma(_abs, nAdv)
+
+    // [F5] Every element is returned at offset [1] so that, combined with
+    // lookahead_on at the call site, the value is the last CONFIRMED higher-
+    // timeframe bar — identical in history and in realtime. v1 used neither,
+    // which is why S1/S4 flipped between backtest and live.
+    [_atr[1], _atrP, _adv[1], _hi[1], _lo[1], _r1[1], _r2[1], _r3[1], _m121[1],
+     _s50[1], _s200[1], _rsi[1], _adx[1], _gapA[1], bar_index[1]]
+
+ctxTf = ctxFromDaily ? "D" : timeframe.period
+[dAtr, dAtrPct, dAdvUsd, dHi52, dLo52, dRoc20, dRoc60, dRoc126, dMom121,
+ dSma50, dSma200, dRsi, dAdx, dGapAvg, dCtxBars] =
+     request.security(syminfo.tickerid, ctxTf, f_ctx(ctxBpy), lookahead = barmerge.lookahead_on)
+
+dRange52   = nz(dHi52) - nz(dLo52)
+distFromHi = dRange52 > 0 ? (dHi52 - close) / dRange52 * 100.0 : na   // 0 = at high
+distFromLo = dRange52 > 0 ? (close - dLo52) / dRange52 * 100.0 : na   // 0 = at low
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                       CHART-TIMEFRAME CALCULATIONS                       ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+atr      = ta.atr(atrLen)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+rsi14    = ta.rsi(close, 14)
+volSMA20 = ta.sma(volume, 20)
+relVol   = volSMA20 > 0 ? volume / volSMA20 : na
+
+// Relative-volume percentile over 50 chart bars, valid-bar guarded.
+// NOTE: this is NOT time-of-day normalized. On an intraday chart it compares a
+// 10:05 bar against a 14:30 bar, which is meaningless — intraday volume has a
+// strong U-shaped seasonality. The Phase 5 intraday profile replaces this with
+// a per-minute-of-day EWMA. Until then, treat rvPctile as daily-and-slower.
+rvSeen = 0
+rvCnt  = 0
+for i = 1 to 50
+    if not na(volSMA20[i]) and volSMA20[i] > 0 and not na(relVol)
+        rvSeen += 1
+        if relVol > (volume[i] / volSMA20[i])
+            rvCnt += 1
+rvPctile = rvSeen >= 20 ? rvCnt / rvSeen * 100.0 : na
+
+volAboveAvg = not na(volSMA20) and volume > volSMA20 * 1.15
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                          REGIME DETECTION                                ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+chopATR = math.sum(ta.tr, chopLen)
+chopHL  = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
+chop    = chopHL > 0 ? 100.0 * math.log10(chopATR / chopHL) / math.log10(chopLen) : na
+
+[bbMid, bbUp, bbLo] = ta.bb(close, bbwLen, bbwStd)
+bbw            = bbMid != 0 ? (bbUp - bbLo) / bbMid * 100.0 : na
+bbwSMA         = ta.sma(bbw, 50)
+bbwExpanding   = not na(bbwSMA) and bbw > bbwSMA * 1.1
+bbwContracting = not na(bbwSMA) and bbw < bbwSMA * 0.9
+
+atrSMA50     = ta.sma(atr, 50)
+atrExpanding = not na(atrSMA50) and atr > atrSMA50 * 1.2
+
+cChop = nz(chop, 50.0)
+trendScore    = math.min((adxVal > adxTrendThr ? (adxVal - adxTrendThr) / 15.0 : 0.0) +
+     (cChop < 38.2 ? (38.2 - cChop) / 20.0 : 0.0), 1.0) * 100.0
+breakoutScore = math.min((atrExpanding ? 0.4 : 0.0) + (bbwExpanding ? 0.4 : 0.0) +
+     (adxVal > adxRangeThr ? 0.2 : 0.0), 1.0) * 100.0
+meanRevScore  = math.min((adxVal < adxRangeThr ? (adxRangeThr - adxVal) / 10.0 : 0.0) +
+     (cChop > 61.8 ? (cChop - 61.8) / 20.0 : 0.0) + (bbwContracting ? 0.3 : 0.0), 1.0) * 100.0
+momentumScore = math.min((adxVal > adxRangeThr and adxVal <= adxTrendThr ? 0.5 : 0.0) +
+     (not bbwContracting and not bbwExpanding ? 0.3 : 0.0) +
+     (math.abs(nz(dRoc20)) > 3.0 ? 0.2 : 0.0), 1.0) * 100.0
+
+regimeTrend    = trendScore    >= 60
+regimeBreakout = breakoutScore >= 60
+regimeMeanRev  = meanRevScore  >= 60
+regimeMomentum = momentumScore >= 55 and not regimeBreakout and not regimeTrend and not regimeMeanRev
+
+regime    = regimeBreakout ? 2 : regimeTrend ? 4 : regimeMomentum ? 3 : regimeMeanRev ? 1 : 0
+regimeStr = regime == 1 ? "MEAN_REV" : regime == 2 ? "BREAKOUT" : regime == 3 ? "MOMENTUM" :
+            regime == 4 ? "TRENDING" : "NEUTRAL"
+regimeConf = regime == 1 ? meanRevScore : regime == 2 ? breakoutScore :
+             regime == 3 ? momentumScore : regime == 4 ? trendScore : 0.0
+
+// Secondary regime by rank rather than float equality. v1 compared computed
+// float sums with == to identify the runner-up, which is fragile and could
+// mislabel it.
+r2Score = 0.0
+r2Id    = 0
+if regime != 1 and meanRevScore > r2Score
+    r2Score := meanRevScore
+    r2Id    := 1
+if regime != 2 and breakoutScore > r2Score
+    r2Score := breakoutScore
+    r2Id    := 2
+if regime != 3 and momentumScore > r2Score
+    r2Score := momentumScore
+    r2Id    := 3
+if regime != 4 and trendScore > r2Score
+    r2Score := trendScore
+    r2Id    := 4
+regime2Str = r2Id == 1 ? "MEAN_REV" : r2Id == 2 ? "BREAKOUT" : r2Id == 3 ? "MOMENTUM" :
+             r2Id == 4 ? "TRENDING" : "NEUTRAL"
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                     SUB-STRATEGY SCORING  [F9]                           ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// One rubric for all four, and THE TRIGGER IS A BOOLEAN GATE WORTH ZERO POINTS.
+//
+// v1 gave S2 a flat 30 points for merely breaking the channel, plus 10 for any
+// volume and 5 for any regime — an effective floor of 45 before it demonstrated
+// anything — while S1 had to earn every one of its points. Comparing those two
+// numbers to pick a winner, and then ranking them cross-sectionally against
+// other symbols, was comparing different units. The rubric below is the same
+// 100 points spent the same way in all four strategies:
+//
+//   trend alignment      0-25   is the higher-timeframe backdrop with us
+//   momentum quality     0-25   is the move itself any good
+//   volatility/location  0-20   is this a sane place to be entering
+//   volume confirmation  0-15   did participation confirm it
+//   HTF / regime context 0-15   does the prevailing regime favour this style
+//
+// The scores are STILL hand-assigned and still unvalidated. What has changed is
+// that they are now comparable to each other, which is a precondition for the
+// Phase 2 expectancy-by-decile work, not a substitute for it.
+f_rubric(bool trig, float trend, float mom, float loc, float vol, float htf) =>
+    trig ? math.min(100.0, math.max(0.0, trend) + math.max(0.0, mom) +
+           math.max(0.0, loc) + math.max(0.0, vol) + math.max(0.0, htf)) : 0.0
+
+// Shared building blocks
+aboveLT   = not na(dSma200) and close > dSma200
+belowLT   = not na(dSma200) and close < dSma200
+ltUp      = not na(dSma50) and not na(dSma200) and dSma50 > dSma200
+ltDn      = not na(dSma50) and not na(dSma200) and dSma50 < dSma200
+volScore  = (volAboveAvg ? 10.0 : 0.0) + (nz(rvPctile, 50.0) > 70.0 ? 5.0 : 0.0)
+atrSane   = not na(dAtrPct) and dAtrPct >= 15.0 and dAtrPct <= 85.0
+
+// ── S1: RSI Mean Reversion ──────────────────────────────────────────────────
+s1_rsi        = ta.rsi(close, s1_rsiLen)
+s1_nearSupp   = close - ta.lowest(low, s1_supportLen) < atr * 1.5
+s1_nearResist = ta.highest(high, s1_supportLen) - close < atr * 1.5
+s1_trigL      = s1_rsi < s1_oversold   and s1_nearSupp
+s1_trigS      = s1_rsi > s1_overbought and s1_nearResist
+
+s1_scoreLong = f_rubric(s1_trigL,
+     (aboveLT and ltUp ? 25.0 : aboveLT ? 18.0 : not na(dSma50) and close > dSma50 ? 10.0 : 0.0),
+     (s1_rsi < s1_oversold - 10 ? 25.0 : s1_rsi < s1_oversold - 5 ? 20.0 : 14.0),
+     (nz(distFromHi, 50.0) > 50.0 ? 12.0 : nz(distFromHi, 50.0) > 30.0 ? 7.0 : 3.0) + (atrSane ? 8.0 : 0.0),
+     volScore,
+     (regimeMeanRev ? 15.0 : regime == 0 ? 8.0 : 0.0))
+
+s1_scoreShort = f_rubric(s1_trigS,
+     (belowLT and ltDn ? 25.0 : belowLT ? 18.0 : not na(dSma50) and close < dSma50 ? 10.0 : 0.0),
+     (s1_rsi > s1_overbought + 10 ? 25.0 : s1_rsi > s1_overbought + 5 ? 20.0 : 14.0),
+     (nz(distFromLo, 50.0) > 50.0 ? 12.0 : nz(distFromLo, 50.0) > 30.0 ? 7.0 : 3.0) + (atrSane ? 8.0 : 0.0),
+     volScore,
+     (regimeMeanRev ? 15.0 : regime == 0 ? 8.0 : 0.0))
+
+// ── S2: Donchian Breakout ───────────────────────────────────────────────────
+s2_entryHigh = ta.highest(high, s2_entryLen)
+s2_entryLow  = ta.lowest(low,  s2_entryLen)
+s2_sma       = ta.sma(close, s2_trendSMA)
+s2_volSpike  = not na(volSMA20) and volume > volSMA20 * s2_volMult
+s2_chanH     = s2_entryHigh[1] - s2_entryLow[1]
+// Close beyond the channel, not merely a wick through it.
+s2_breakHi   = close > s2_entryHigh[1]
+s2_breakLo   = close < s2_entryLow[1]
+// Do not chase: block when price is already far beyond the trend SMA.
+s2_extUp     = not na(s2_sma) and close > s2_sma + atr * 1.5
+s2_extDn     = not na(s2_sma) and close < s2_sma - atr * 1.5
+s2_hasVol    = s2_volSpike or volAboveAvg
+s2_trigL     = s2_breakHi and not s2_extUp and s2_hasVol
+s2_trigS     = s2_breakLo and not s2_extDn and s2_hasVol
+
+s2_scoreLong = f_rubric(s2_trigL,
+     (not na(s2_sma) and close > s2_sma ? 12.0 : 0.0) + (aboveLT ? 8.0 : 0.0) + (ltUp ? 5.0 : 0.0),
+     (adxVal > adxTrendThr ? 18.0 : adxVal > adxRangeThr ? 10.0 : 0.0) + (diPlus > diMinus ? 7.0 : 0.0),
+     (atrExpanding ? 8.0 : 0.0) + (bbwExpanding ? 7.0 : 0.0) + (nz(distFromLo, 50.0) > 70.0 ? 5.0 : 0.0),
+     (s2_volSpike ? 15.0 : volAboveAvg ? 8.0 : 0.0),
+     (regimeBreakout ? 15.0 : regime == 4 ? 10.0 : regime == 0 ? 5.0 : 0.0))
+
+s2_scoreShort = f_rubric(s2_trigS,
+     (not na(s2_sma) and close < s2_sma ? 12.0 : 0.0) + (belowLT ? 8.0 : 0.0) + (ltDn ? 5.0 : 0.0),
+     (adxVal > adxTrendThr ? 18.0 : adxVal > adxRangeThr ? 10.0 : 0.0) + (diMinus > diPlus ? 7.0 : 0.0),
+     (atrExpanding ? 8.0 : 0.0) + (bbwExpanding ? 7.0 : 0.0) + (nz(distFromHi, 50.0) > 70.0 ? 5.0 : 0.0),
+     (s2_volSpike ? 15.0 : volAboveAvg ? 8.0 : 0.0),
+     (regimeBreakout ? 15.0 : regime == 4 ? 10.0 : regime == 0 ? 5.0 : 0.0))
+
+// ── S3: EMA / VWAP Momentum ─────────────────────────────────────────────────
+s3_fast  = ta.ema(close, s3_fastEMA)
+s3_slow  = ta.ema(close, s3_slowEMA)
+s3_trend = ta.ema(close, s3_trendEMA)
+[s3_macd, s3_sig, s3_hist] = ta.macd(close, s3_macdFast, s3_macdSlow, s3_macdSig)
+// VWAP is only meaningful intraday; on daily and above use a volume-weighted MA.
+s3_anchor = timeframe.isintraday ? ta.vwap(hlc3) : ta.vwma(close, 20)
+s3_bsUp   = ta.barssince(ta.crossover(s3_fast, s3_slow))
+s3_bsDn   = ta.barssince(ta.crossunder(s3_fast, s3_slow))
+// Require a RECENT cross so we score an event, not a persistent state.
+s3_trigL  = not na(s3_bsUp) and s3_bsUp <= s3_crossMax and rsi14 <= 70
+s3_trigS  = not na(s3_bsDn) and s3_bsDn <= s3_crossMax and rsi14 >= 30
+
+s3_scoreLong = f_rubric(s3_trigL,
+     (close > s3_trend ? 12.0 : 0.0) + (close > s3_anchor ? 8.0 : 0.0) + (aboveLT ? 5.0 : 0.0),
+     (s3_hist > 0 and rsi14 > 50 ? 15.0 : s3_hist > 0 ? 8.0 : 0.0) +
+     (nz(dRoc20) > 3.0 ? 6.0 : 0.0) + (s3_hist > nz(s3_hist[1]) ? 4.0 : 0.0),
+     (s3_fast > s3_slow ? 8.0 : 0.0) + (close - s3_trend < atr * 3.0 ? 6.0 : 0.0) + (atrSane ? 6.0 : 0.0),
+     volScore,
+     (regimeMomentum ? 15.0 : regime == 4 ? 10.0 : regime == 2 ? 8.0 : regime == 0 ? 5.0 : 0.0))
+
+s3_scoreShort = f_rubric(s3_trigS,
+     (close < s3_trend ? 12.0 : 0.0) + (close < s3_anchor ? 8.0 : 0.0) + (belowLT ? 5.0 : 0.0),
+     (s3_hist < 0 and rsi14 < 50 ? 15.0 : s3_hist < 0 ? 8.0 : 0.0) +
+     (nz(dRoc20) < -3.0 ? 6.0 : 0.0) + (s3_hist < nz(s3_hist[1]) ? 4.0 : 0.0),
+     (s3_fast < s3_slow ? 8.0 : 0.0) + (s3_trend - close < atr * 3.0 ? 6.0 : 0.0) + (atrSane ? 6.0 : 0.0),
+     volScore,
+     (regimeMomentum ? 15.0 : regime == 4 ? 10.0 : regime == 2 ? 8.0 : regime == 0 ? 5.0 : 0.0))
+
+// ── S4: Multi-Timeframe Trend ───────────────────────────────────────────────
+// [F5] Weekly context at offset [1] with lookahead_on: last CONFIRMED weekly
+// bar, identical in history and realtime. v1 used neither and repainted.
+f_wk() =>
+    _f = ta.ema(close, s4_wkFast)
+    _s = ta.ema(close, s4_wkSlow)
+    [_dp, _dm, _a] = ta.dmi(14, 14)
+    [_f[1], _s[1], close[1], _a[1]]
+
+wkTf = timeframe.in_seconds(timeframe.period) < timeframe.in_seconds("W") ? "W" : timeframe.period
+[s4_wkF, s4_wkS, s4_wkC, s4_wkADX] = request.security(syminfo.tickerid, wkTf, f_wk(),
+     lookahead = barmerge.lookahead_on)
+
+s4_dEMA  = ta.ema(close, s4_dailyEMA)
+[s4_macd, s4_sig, s4_h] = ta.macd(close, 12, 26, 9)
+s4_wkBull = not na(s4_wkF) and not na(s4_wkS) and s4_wkF > s4_wkS and s4_wkC > s4_wkF
+s4_wkBear = not na(s4_wkF) and not na(s4_wkS) and s4_wkF < s4_wkS and s4_wkC < s4_wkF
+s4_pbBuy  = rsi14 < s4_rsiPBLo and rsi14 > 25
+s4_pbSell = rsi14 > s4_rsiPBHi and rsi14 < 75
+s4_bounce = close > s4_dEMA and close[1] <= s4_dEMA[1]
+s4_reject = close < s4_dEMA and close[1] >= s4_dEMA[1]
+s4_trigL  = s4_wkBull and (s4_pbBuy  or s4_bounce)
+s4_trigS  = s4_wkBear and (s4_pbSell or s4_reject)
+
+s4_scoreLong = f_rubric(s4_trigL,
+     (s4_wkBull ? 15.0 : 0.0) + (aboveLT ? 10.0 : 0.0),
+     (nz(s4_wkADX) > 20.0 ? 10.0 : 0.0) + (s4_macd > s4_sig ? 8.0 : 0.0) + (nz(dMom121) > 0.0 ? 7.0 : 0.0),
+     (s4_pbBuy ? 12.0 : s4_bounce ? 8.0 : 0.0) + (atrSane ? 8.0 : 0.0),
+     volScore,
+     (regimeTrend ? 15.0 : regime == 3 ? 10.0 : regime == 0 ? 5.0 : 0.0))
+
+s4_scoreShort = f_rubric(s4_trigS,
+     (s4_wkBear ? 15.0 : 0.0) + (belowLT ? 10.0 : 0.0),
+     (nz(s4_wkADX) > 20.0 ? 10.0 : 0.0) + (s4_macd < s4_sig ? 8.0 : 0.0) + (nz(dMom121) < 0.0 ? 7.0 : 0.0),
+     (s4_pbSell ? 12.0 : s4_reject ? 8.0 : 0.0) + (atrSane ? 8.0 : 0.0),
+     volScore,
+     (regimeTrend ? 15.0 : regime == 3 ? 10.0 : regime == 0 ? 5.0 : 0.0))
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                  WINNER SELECTION  [F3]                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// The v1 bug: it computed bestLongScore and bestShortScore, took
+// bestDir = bestLongScore >= bestShortScore ? "BUY" : "SELL", and ONLY THEN
+// checked whether shorts were enabled — setting bestDirOk = false and
+// suppressing the entire bar. A stronger short therefore destroyed a valid
+// long instead of losing to it. Direction filtering now happens BEFORE argmax,
+// so a disabled direction can never veto an enabled one.
+s1_aligned = not useRegimeFilter or regime == 1 or regime == 0
+s2_aligned = not useRegimeFilter or regime == 2 or regime == 4 or regime == 0
+s3_aligned = not useRegimeFilter or regime == 3 or regime == 4 or regime == 0
+s4_aligned = not useRegimeFilter or regime == 4 or regime == 0
+
+s1L = s1_aligned ? s1_scoreLong : 0.0
+s2L = s2_aligned ? s2_scoreLong : 0.0
+s3L = s3_aligned ? s3_scoreLong : 0.0
+s4L = s4_aligned ? s4_scoreLong : 0.0
+s1S = shortEnabled and s1_aligned ? s1_scoreShort : 0.0
+s2S = shortEnabled and s2_aligned ? s2_scoreShort : 0.0
+s3S = shortEnabled and s3_aligned ? s3_scoreShort : 0.0
+s4S = shortEnabled and s4_aligned ? s4_scoreShort : 0.0
+
+bestLongScore = math.max(s1L, math.max(s2L, math.max(s3L, s4L)))
+bestLongStrat = bestLongScore <= 0.0 ? 0 :
+     bestLongScore == s1L ? 1 : bestLongScore == s2L ? 2 : bestLongScore == s3L ? 3 : 4
+bestShortScore = math.max(s1S, math.max(s2S, math.max(s3S, s4S)))
+bestShortStrat = bestShortScore <= 0.0 ? 0 :
+     bestShortScore == s1S ? 1 : bestShortScore == s2S ? 2 : bestShortScore == s3S ? 3 : 4
+
+isLong    = bestLongScore >= bestShortScore
+bestScore = isLong ? bestLongScore : bestShortScore
+bestStrat = isLong ? bestLongStrat : bestShortStrat
+bestDir   = isLong ? "BUY" : "SELL"
+
+stratName(int id) => id == 1 ? "RSI_MeanReversion" : id == 2 ? "Donchian_Breakout" :
+     id == 3 ? "EMA_VWAP_Momentum" : id == 4 ? "MultiTF_Trend" : "None"
+stratTag(int id)  => id == 1 ? "MR" : id == 2 ? "BRK" : id == 3 ? "MOM" : id == 4 ? "MTF" : "--"
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                        RISK LEVELS  [F7] [F8]                            ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// Stops are ATR multiples scaled by the profile; targets are STRUCTURAL where a
+// structure exists. That matters: if the target were simply stop * targetRR the
+// R:R gate would be circular and would pass by construction.
+stopScale = effAtrStop / 1.5
+
+s1_stopD = atr * 1.20 * stopScale
+s2_stopD = math.max(atr * 0.80 * stopScale,
+     (isLong ? math.abs(close - s2_entryHigh[1]) : math.abs(s2_entryLow[1] - close)) + atr * 0.30)
+s3_stopD = atr * 1.80 * stopScale
+s4_stopD = atr * 2.50 * stopScale
+stopDist = bestStrat == 1 ? s1_stopD : bestStrat == 2 ? s2_stopD : bestStrat == 3 ? s3_stopD : s4_stopD
+
+// Targets: S1 reverts to the band mid / prior extreme, S2 takes the measured
+// move of the channel it broke, S3 and S4 use ATR projections sized to horizon.
+s1_tpD = math.min(math.max(math.abs(nz(bbMid, close) - close), atr * 1.5), atr * 4.0)
+s2_tpD = math.max(nz(s2_chanH, atr * 2.0), atr * 1.5)
+s3_tpD = atr * 3.0
+s4_tpD = atr * 4.0
+tpDist = bestStrat == 1 ? s1_tpD : bestStrat == 2 ? s2_tpD : bestStrat == 3 ? s3_tpD : s4_tpD
+
+// [F8] Round to mintick BEFORE measuring R:R, so the gate tests the price that
+// will actually be worked at the broker. v1 emitted unrounded prices, which
+// IBKR can reject outright.
+entryRef  = math.round_to_mintick(close)
+stopPrice = math.round_to_mintick(isLong ? close - stopDist : close + stopDist)
+tpPrice   = math.round_to_mintick(isLong ? close + tpDist   : close - tpDist)
+realRisk  = math.abs(entryRef - stopPrice)
+realRwd   = math.abs(tpPrice  - entryRef)
+rrRatio   = realRisk > 0 ? realRwd / realRisk : 0.0
+rrOk      = rrRatio >= effMinRR                      // [F7] now enforced
+stopPct   = close > 0 ? realRisk / close * 100.0 : 0.0
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                       GATES AND FIRE CONDITION                           ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// [F6] Warmup. Regime needs the 50-bar BBW and ATR baselines; the percentiles
+// need a real sample. v1 had no gate and emitted confident-looking output from
+// bar 1 on freshly listed symbols.
+warmupOk = bar_index >= 100 and not na(dAtr) and not na(dSma200) and not na(bbwSMA) and
+     not na(rvPctile) and not na(dAtrPct) and nz(dCtxBars) >= math.round(ctxBpy * 0.8)
+
+// [F12] Session gate. Replaces v1's `hour(time_close) == 13`, which was valid
+// only for 4H US-equity bars and on a 5m chart fired exactly once a day at 13:00.
+inSession = not useSessionGate or not timeframe.isintraday or
+     not na(time(timeframe.period, gateSession))
+lastBarOk = not fireOnLastBar or not timeframe.isintraday or session.islastbar
+hourOk    = noEntryAfter == 0 or not timeframe.isintraday or hour(time_close) < noEntryAfter
+
+// Liquidity from the DAILY context — twenty days on every timeframe.
+liquidityOk = (minDollarVol <= 0.0 or (not na(dAdvUsd) and dAdvUsd >= minDollarVol * 1000000.0)) and
+     (minPrice <= 0.0 or close >= minPrice)
+
+// [F13] Cooldown in wall-clock minutes, not bars.
+var int lastSigTime = 0
+cooldownOk = lastSigTime == 0 or (time - lastSigTime) >= effCooldown * 60000
+
+fireSignal = barstate.isconfirmed and warmupOk and bestStrat > 0 and bestScore >= effMinScore and
+     rrOk and liquidityOk and inSession and lastBarOk and hourOk and cooldownOk
+
+// Composite score for cross-sectional ranking server-side. S1 wants distance
+// FROM the 52-week high (room to revert); the trend strategies want proximity
+// TO it. na-guarded so a warmup symbol cannot rank on defaults.
+dist52Comp     = bestStrat == 1 ? nz(distFromHi, 50.0) : nz(distFromLo, 50.0)
+compositeScore = bestScore * 0.50 + regimeConf * 0.20 + nz(rvPctile, 50.0) * 0.15 +
+     (100.0 - nz(dAtrPct, 50.0)) * 0.05 + dist52Comp * 0.10
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                       CONFIDENCE  [F2]                                   ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// The executor sizes on this field and v1 never sent it, so every signal took
+// the unset default of 1.5% NAV and the entire scoring engine had no effect on
+// capital at risk. Emitting it is the fix. Emitting a SCORE-DERIVED value is a
+// separate decision that must wait for Phase 2 — an unvalidated rubric should
+// not be choosing position size. Default OFF reproduces today's flat 1.5%.
+confRaw = useScoreConfidence ?
+     confAtMin + (bestScore - effMinScore) / math.max(1.0, 100.0 - effMinScore) * (confAtMax - confAtMin) :
+     confFlat
+confidence = math.min(0.99, math.max(0.31, confRaw))
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                       WEBHOOK PAYLOAD  [F1]                              ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+secType      = input.string("STK", "sec_type", options = ["STK", "OPT", "FUT"], group = "Webhook",
+     tooltip = "The TVSignal model's actual default is STK. v1's header claimed OPT and 'options-only pipeline', which was wrong — exactly the vocabulary drift that header said it was preventing.")
+accountRoute = input.string("IBKR_TAXABLE", "account_route",
+     options = ["IBKR_TAXABLE", "IBKR_IRA", "FIDELITY_403B_MANUAL"], group = "Webhook")
+exchangeHint = input.string("", "exchange hint (blank = SMART)", group = "Webhook")
+
+// The payload is deliberately DUAL-FORM.
+//
+//   Top-level `stop`, `price`, `comment`, `strategy` are fields the CURRENT
+//   TVSignal model already declares, so the stop and the decision context
+//   arrive intact even before the server is patched. This is the part that
+//   fixes production today.
+//
+//   The nested blocks below are schema v2 for the patched server. Pydantic's
+//   default extra='ignore' means an unpatched server drops them silently
+//   rather than 422-ing, so shipping both is safe.
+safeTicker = str.replace_all(syminfo.ticker, '"', '\\"')
+f2(float v) => str.tostring(v, "0.##")
+f1(float v) => str.tostring(v, "0.#")
+
+var int sigSeq = 0
+signalId = safeTicker + "|" + profileStr + "|" + str.tostring(time) + "|" + str.tostring(sigSeq)
+
+// Compact digest for the `comment` field — the one free-text channel that
+// reaches the executor on an unpatched server.
+digest = "ASR2|" + profileStr + "|" + stratTag(bestStrat) +
+     "|sc=" + f1(bestScore) + "|cf=" + str.tostring(confidence, "0.00") +
+     "|rr=" + f1(rrRatio) + "|sl=" + f2(stopPrice) + "|tp=" + f2(tpPrice) +
+     "|rg=" + regimeStr + "|rv=" + f1(nz(rvPctile, 50.0)) + "|cmp=" + f1(compositeScore)
+
+timeStopAt = time + p_timeStopDays * 86400000
+
+payload =
+ '{' +
+   '"schema_version":"2.0.0",' +
+   '"signal_id":"' + signalId + '",' +
+   '"profile":"' + profileStr + '",' +
+   '"account_route":"' + accountRoute + '",' +
+   '"manual_only":' + (accountRoute == "FIDELITY_403B_MANUAL" ? "true" : "false") + ',' +
+   // --- fields the current TVSignal model already accepts ---
+   '"symbol":"' + safeTicker + '",' +
+   '"action":"' + bestDir + '",' +
+   '"qty":1,' +
+   '"order_type":"MKT",' +
+   '"price":' + f2(entryRef) + ',' +
+   '"stop":' + f2(stopPrice) + ',' +
+   '"tif":"DAY",' +
+   '"sec_type":"' + secType + '",' +
+   '"exchange":"' + exchangeHint + '",' +
+   '"strategy":"' + stratName(bestStrat) + '",' +
+   '"comment":"' + digest + '",' +
+   // --- schema v2 ---
+   '"confidence":' + str.tostring(confidence, "0.00") + ',' +
+   '"thesis":{' +
+     '"direction":"' + (isLong ? "LONG" : "SHORT") + '",' +
+     '"horizon_days":' + str.tostring(p_timeStopDays) + ',' +
+     '"expected_move_atr":' + f2(atr > 0 ? tpDist / atr : 0.0) +
+   '},' +
+   '"desired_state":{' +
+     '"side":"' + (isLong ? "LONG" : "SHORT") + '",' +
+     '"entry_ref":' + f2(entryRef) + ',' +
+     '"stop":' + f2(stopPrice) + ',' +
+     '"targets":[{"price":' + f2(tpPrice) + ',"fraction":0.5}],' +
+     '"time_stop_at":' + str.tostring(timeStopAt) + ',' +
+     '"invalidate_if":"regime_leaves:' + regimeStr + '"' +
+   '},' +
+   '"sizing":{' +
+     '"stop_distance":' + f2(realRisk) + ',' +
+     '"stop_pct":' + f2(stopPct) + ',' +
+     '"rr_ratio":' + f2(rrRatio) + ',' +
+     '"atr_chart":' + f2(atr) + ',' +
+     '"atr_daily":' + f2(nz(dAtr)) +
+   '},' +
+   '"scores":{' +
+     '"conviction":' + f1(bestScore) + ',' +
+     '"composite":' + f1(compositeScore) + ',' +
+     '"winner":"' + stratTag(bestStrat) + '",' +
+     '"s1":' + f1(math.max(s1L, s1S)) + ',' +
+     '"s2":' + f1(math.max(s2L, s2S)) + ',' +
+     '"s3":' + f1(math.max(s3L, s3S)) + ',' +
+     '"s4":' + f1(math.max(s4L, s4S)) + ',' +
+     '"calibrated":false' +
+   '},' +
+   '"regime":{' +
+     '"label":"' + regimeStr + '",' +
+     '"confidence":' + f1(regimeConf) + ',' +
+     '"secondary":"' + regime2Str + '",' +
+     '"secondary_score":' + f1(r2Score) + ',' +
+     '"trend":' + f1(trendScore) + ',' +
+     '"breakout":' + f1(breakoutScore) + ',' +
+     '"meanrev":' + f1(meanRevScore) + ',' +
+     '"momentum":' + f1(momentumScore) +
+   '},' +
+   '"context":{' +
+     '"feature_basis":"daily",' +
+     '"rsi":' + f1(rsi14) + ',' +
+     '"adx":' + f1(adxVal) + ',' +
+     '"chop":' + f1(nz(chop, 50.0)) + ',' +
+     '"atr_pctile":' + f1(nz(dAtrPct, 50.0)) + ',' +
+     '"rel_vol_pctile":' + f1(nz(rvPctile, 50.0)) + ',' +
+     '"roc_20d":' + f2(nz(dRoc20)) + ',' +
+     '"roc_60d":' + f2(nz(dRoc60)) + ',' +
+     '"roc_126d":' + f2(nz(dRoc126)) + ',' +
+     '"mom_12_1":' + f2(nz(dMom121)) + ',' +
+     '"dist_52wk_hi":' + f1(nz(distFromHi, 50.0)) + ',' +
+     '"dist_52wk_lo":' + f1(nz(distFromLo, 50.0)) + ',' +
+     '"rsi_daily":' + f1(nz(dRsi, 50.0)) + ',' +
+     '"adx_daily":' + f1(nz(dAdx)) + ',' +
+     '"adv20_usd":' + str.tostring(nz(dAdvUsd), "0") + ',' +
+     '"avg_gap_pct":' + f2(nz(dGapAvg)) +
+   '},' +
+   '"meta":{' +
+     '"bar_time":' + str.tostring(time) + ',' +
+     '"bar_close_time":' + str.tostring(time_close) + ',' +
+     '"tf":"' + timeframe.period + '",' +
+     '"warmup_ok":true,' +
+     '"bars_per_day":' + f2(bpd) + ',' +
+     '"bpd_drift_pct":' + f1(bpdDrift) + ',' +
+     '"script_version":"2.0.0-phase1"' +
+   '}' +
+ '}'
+
+if fireSignal
+    lastSigTime := time
+    sigSeq      += 1
+    alert(payload, alert.freq_once_per_bar_close)
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                        VISUALIZATION  [F11]                              ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// v1 maintained entryPrice / entryDir / slLevel / tpLevel and a live P&L row,
+// as if the indicator knew the broker's state. It did not: it never saw a fill,
+// a partial, a slip or a manual override, and when both the stop and the target
+// were touched inside one bar it resolved the ambiguity arbitrarily and then
+// reported a P&L from it. All of that is removed. What remains is a truthful
+// record of what this script last EMITTED, labelled as reference levels.
+var float refEntry = na
+var float refStop  = na
+var float refTp    = na
+var int   refDir   = 0
+var int   refBar   = na
+var string refTag  = ""
+var line  lnE = na
+var line  lnS = na
+var line  lnT = na
+var label lbS = na
+var label lbT = na
+
+if fireSignal and showLevels
+    refEntry := entryRef
+    refStop  := stopPrice
+    refTp    := tpPrice
+    refDir   := isLong ? 1 : -1
+    refBar   := bar_index
+    refTag   := stratTag(bestStrat)
+    if not na(lnE)
+        line.delete(lnE)
+    if not na(lnS)
+        line.delete(lnS)
+    if not na(lnT)
+        line.delete(lnT)
+    if not na(lbS)
+        label.delete(lbS)
+    if not na(lbT)
+        label.delete(lbT)
+    lnE := line.new(bar_index, refEntry, bar_index + 20, refEntry, color = color.white,  width = 1, style = line.style_dotted)
+    lnS := line.new(bar_index, refStop,  bar_index + 20, refStop,  color = color.red,    width = 2)
+    lnT := line.new(bar_index, refTp,    bar_index + 20, refTp,    color = color.green,  width = 2)
+    lbS := label.new(bar_index + 21, refStop, "ref SL " + str.tostring(refStop, "0.##"),
+         color = color.new(color.red, 80), textcolor = color.red, style = label.style_label_left, size = size.tiny)
+    lbT := label.new(bar_index + 21, refTp, "ref TP " + str.tostring(refTp, "0.##") + "  R:R " + str.tostring(rrRatio, "0.#"),
+         color = color.new(color.green, 80), textcolor = color.green, style = label.style_label_left, size = size.tiny)
+
+// Whether price has since traded through a reference level. This describes the
+// CHART, not a position — no fill is implied and no P&L is claimed.
+refStopTouched = (refDir ==  1 and not na(refStop) and low  <= refStop) or
+                 (refDir == -1 and not na(refStop) and high >= refStop)
+refTpTouched   = (refDir ==  1 and not na(refTp)   and high >= refTp) or
+                 (refDir == -1 and not na(refTp)   and low  <= refTp)
+var string refOutcome = "—"
+if refStopTouched and refOutcome == "—"
+    refOutcome := "SL touched"
+if refTpTouched and refOutcome == "—"
+    refOutcome := "TP touched"
+if fireSignal
+    refOutcome := "open"
+
+plot(dSma200, "SMA200 (daily ctx)", color = color.new(color.gray, 20), linewidth = 1)
+plot(s3_fast, "EMA Fast",  color = color.new(color.blue, 40))
+plot(s3_slow, "EMA Slow",  color = color.new(color.orange, 40))
+plot(s2_entryHigh, "DC High", color = color.new(color.green, 70))
+plot(s2_entryLow,  "DC Low",  color = color.new(color.red, 70))
+
+plotshape(fireSignal and isLong  and not showStratLabel, "Long",  shape.triangleup,
+     location.belowbar, color.green, size = size.small)
+plotshape(fireSignal and not isLong and not showStratLabel, "Short", shape.triangledown,
+     location.abovebar, color.red, size = size.small)
+plotshape(fireSignal and isLong  and showStratLabel, "Long tagged", shape.labelup,
+     location.belowbar, color.green, text = "L", textcolor = color.white, size = size.small)
+plotshape(fireSignal and not isLong and showStratLabel, "Short tagged", shape.labeldown,
+     location.abovebar, color.red, text = "S", textcolor = color.white, size = size.small)
+
+bgcolor(showRegimeBG ? (regime == 4 ? color.new(color.green, 96) : regime == 2 ? color.new(color.yellow, 95) :
+     regime == 3 ? color.new(color.blue, 96) : regime == 1 ? color.new(color.purple, 96) :
+     color.new(color.gray, 98)) : na, title = "Regime BG")
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                            DASHBOARD                                     ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// The BLOCK row is the point of this table: when nothing is firing it names the
+// single gate responsible, which is the question you actually have when staring
+// at a quiet chart.
+blockReason = not warmupOk           ? "WARMUP"      :
+     bestStrat == 0                  ? "NO SETUP"    :
+     bestScore < effMinScore         ? "SCORE"       :
+     not rrOk                        ? "R:R"         :
+     not liquidityOk                 ? "LIQUIDITY"   :
+     not inSession                   ? "SESSION"     :
+     not lastBarOk                   ? "NOT LAST BAR":
+     not hourOk                      ? "TIME CUTOFF" :
+     not cooldownOk                  ? "COOLDOWN"    : "READY"
+
+var table tbl = table.new(position.top_right, 4, 15, border_color = color.gray, border_width = 1,
+     frame_color = color.gray, frame_width = 2)
+
+if barstate.islast and showDash
+    okCol = color.green
+    noCol = color.gray
+
+    table.cell(tbl, 0, 0, syminfo.ticker, bgcolor = color.black, text_color = color.white)
+    table.cell(tbl, 1, 0, timeframe.period, bgcolor = color.navy, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 2, 0, profileStr, bgcolor = color.navy, text_color = color.white, text_size = size.tiny)
+    table.cell(tbl, 3, 0, "v2.0 P1", bgcolor = color.black, text_color = color.gray, text_size = size.tiny)
+
+    rgCol = regime == 4 ? color.green : regime == 2 ? color.yellow : regime == 3 ? color.blue :
+            regime == 1 ? color.purple : color.gray
+    table.cell(tbl, 0, 1, "REGIME", bgcolor = color.maroon, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 1, regimeStr, text_color = rgCol, text_size = size.small)
+    table.cell(tbl, 2, 1, str.tostring(regimeConf, "#"), text_color = rgCol, text_size = size.small)
+    table.cell(tbl, 3, 1, "2nd " + regime2Str, text_color = color.gray, text_size = size.tiny)
+
+    table.cell(tbl, 0, 2, "S1 MeanRev",  bgcolor = color.new(color.purple, 50), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 2, s1L > s1S ? "LONG" : s1S > 0 ? "SHORT" : "—", text_color = s1L > s1S ? okCol : s1S > 0 ? color.red : noCol, text_size = size.small)
+    table.cell(tbl, 2, 2, str.tostring(math.max(s1L, s1S), "#"), text_color = math.max(s1L, s1S) >= effMinScore ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 3, 2, s1_aligned ? "aligned" : "blocked", text_color = s1_aligned ? okCol : color.red, text_size = size.tiny)
+
+    table.cell(tbl, 0, 3, "S2 Breakout", bgcolor = color.new(color.yellow, 50), text_color = color.black, text_size = size.small)
+    table.cell(tbl, 1, 3, s2L > s2S ? "LONG" : s2S > 0 ? "SHORT" : "—", text_color = s2L > s2S ? okCol : s2S > 0 ? color.red : noCol, text_size = size.small)
+    table.cell(tbl, 2, 3, str.tostring(math.max(s2L, s2S), "#"), text_color = math.max(s2L, s2S) >= effMinScore ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 3, 3, s2_aligned ? "aligned" : "blocked", text_color = s2_aligned ? okCol : color.red, text_size = size.tiny)
+
+    table.cell(tbl, 0, 4, "S3 Momentum", bgcolor = color.new(color.blue, 50), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 4, s3L > s3S ? "LONG" : s3S > 0 ? "SHORT" : "—", text_color = s3L > s3S ? okCol : s3S > 0 ? color.red : noCol, text_size = size.small)
+    table.cell(tbl, 2, 4, str.tostring(math.max(s3L, s3S), "#"), text_color = math.max(s3L, s3S) >= effMinScore ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 3, 4, s3_aligned ? "aligned" : "blocked", text_color = s3_aligned ? okCol : color.red, text_size = size.tiny)
+
+    table.cell(tbl, 0, 5, "S4 MTF",      bgcolor = color.new(color.teal, 50), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 5, s4L > s4S ? "LONG" : s4S > 0 ? "SHORT" : "—", text_color = s4L > s4S ? okCol : s4S > 0 ? color.red : noCol, text_size = size.small)
+    table.cell(tbl, 2, 5, str.tostring(math.max(s4L, s4S), "#"), text_color = math.max(s4L, s4S) >= effMinScore ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 3, 5, s4_aligned ? "aligned" : "blocked", text_color = s4_aligned ? okCol : color.red, text_size = size.tiny)
+
+    table.cell(tbl, 0, 6, "WINNER", bgcolor = color.navy, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 6, bestStrat > 0 ? stratTag(bestStrat) + " " + bestDir : "—",
+         text_color = bestScore >= effMinScore ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 2, 6, str.tostring(bestScore, "#") + "/" + str.tostring(effMinScore, "#"),
+         text_color = bestScore >= effMinScore ? okCol : color.red, text_size = size.small)
+    table.cell(tbl, 3, 6, "comp " + str.tostring(compositeScore, "0.#"), text_color = color.yellow, text_size = size.tiny)
+
+    table.cell(tbl, 0, 7, "BLOCK", bgcolor = color.maroon, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 7, blockReason, text_color = blockReason == "READY" ? okCol : color.orange, text_size = size.small)
+    table.cell(tbl, 2, 7, "conf " + str.tostring(confidence, "0.00"),
+         text_color = useScoreConfidence ? color.yellow : color.gray, text_size = size.tiny)
+    table.cell(tbl, 3, 7, useScoreConfidence ? "score-derived" : "flat (unvalidated)",
+         text_color = useScoreConfidence ? color.orange : color.gray, text_size = size.tiny)
+
+    table.cell(tbl, 0, 8, "Risk", bgcolor = color.navy, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 8, "SL " + str.tostring(stopPrice, "0.##"), text_color = color.orange, text_size = size.tiny)
+    table.cell(tbl, 2, 8, "TP " + str.tostring(tpPrice, "0.##"),   text_color = color.green,  text_size = size.tiny)
+    table.cell(tbl, 3, 8, "R:R " + str.tostring(rrRatio, "0.#") + " / " + str.tostring(effMinRR, "0.#") +
+         "  " + str.tostring(stopPct, "0.#") + "%",
+         text_color = rrOk ? okCol : color.red, text_size = size.tiny)
+
+    table.cell(tbl, 0, 9, "Daily ctx", bgcolor = color.navy, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 9, "ROC20 " + str.tostring(nz(dRoc20), "0.#") + "%", text_color = nz(dRoc20) > 0 ? okCol : color.red, text_size = size.tiny)
+    table.cell(tbl, 2, 9, "ROC60 " + str.tostring(nz(dRoc60), "0.#") + "%", text_color = nz(dRoc60) > 0 ? okCol : color.red, text_size = size.tiny)
+    table.cell(tbl, 3, 9, "12-1 " + str.tostring(nz(dMom121), "0.#") + "%",  text_color = nz(dMom121) > 0 ? okCol : color.red, text_size = size.tiny)
+
+    table.cell(tbl, 0, 10, "Percentiles", bgcolor = color.navy, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 10, "ATR " + str.tostring(nz(dAtrPct, 50.0), "#") + "p", text_color = color.white, text_size = size.tiny)
+    table.cell(tbl, 2, 10, "rVol " + str.tostring(nz(rvPctile, 50.0), "#") + "p", text_color = nz(rvPctile, 50.0) > 70 ? okCol : color.gray, text_size = size.tiny)
+    table.cell(tbl, 3, 10, "52wk lo " + str.tostring(nz(distFromLo, 50.0), "#") + "%", text_color = color.white, text_size = size.tiny)
+
+    table.cell(tbl, 0, 11, "Liquidity", bgcolor = color.navy, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 11, "$" + str.tostring(nz(dAdvUsd) / 1000000.0, "0.#") + "M", text_color = liquidityOk ? okCol : color.red, text_size = size.tiny)
+    table.cell(tbl, 2, 11, "20-day ADV", text_color = color.gray, text_size = size.tiny)
+    table.cell(tbl, 3, 11, "gap " + str.tostring(nz(dGapAvg), "0.##") + "%", text_color = color.white, text_size = size.tiny)
+
+    table.cell(tbl, 0, 12, "TF norm", bgcolor = color.navy, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 12, "bpd " + str.tostring(bpd, "0.##"), text_color = color.white, text_size = size.tiny)
+    table.cell(tbl, 2, 12, timeframe.isintraday and sessSeen >= 5 ? "obs " + str.tostring(bpdObs, "0.#") : "ctx " + str.tostring(ctxBpy),
+         text_color = bpdDrift > 20.0 ? color.red : color.gray, text_size = size.tiny)
+    table.cell(tbl, 3, 12, bpdDrift > 20.0 ? "CHECK sessionSec" : "ok", text_color = bpdDrift > 20.0 ? color.red : color.gray, text_size = size.tiny)
+
+    table.cell(tbl, 0, 13, "Cooldown", bgcolor = color.navy, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 13, cooldownOk ? "READY" : str.tostring(int(math.ceil((effCooldown * 60000 - (time - lastSigTime)) / 60000.0))) + "m",
+         text_color = cooldownOk ? okCol : color.orange, text_size = size.small)
+    table.cell(tbl, 2, 13, "of " + str.tostring(effCooldown) + "m", text_color = color.gray, text_size = size.tiny)
+    table.cell(tbl, 3, 13, "signals " + str.tostring(sigSeq), text_color = color.gray, text_size = size.tiny)
+
+    table.cell(tbl, 0, 14, "Last emitted", bgcolor = color.black, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 14, refDir == 0 ? "none" : (refDir == 1 ? "LONG " : "SHORT ") + refTag,
+         text_color = refDir == 1 ? okCol : refDir == -1 ? color.red : noCol, text_size = size.tiny)
+    table.cell(tbl, 2, 14, na(refEntry) ? "" : str.tostring(refEntry, "0.##") +
+         (na(refBar) ? "" : "  " + str.tostring(bar_index - refBar) + "b"), text_color = color.white, text_size = size.tiny)
+    table.cell(tbl, 3, 14, refOutcome + " (chart, not broker)", text_color = color.gray, text_size = size.tiny)
