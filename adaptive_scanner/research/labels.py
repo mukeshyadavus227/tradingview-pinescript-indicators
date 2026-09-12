@@ -108,6 +108,16 @@ class ExitModel:
     time_stop: bool = True
 
 
+INTRADAY_MODELS = [
+    ExitModel("I0_fixed2R_eod",        partial_r=0.0, trail_k=0.0, remainder_tp=True,  time_stop=False),
+    ExitModel("I1_partial_chand2_eod", partial_r=1.0, trail_k=2.0, trail_from="partial", remainder_tp=False, time_stop=False),
+    ExitModel("I2_chand2_eod",         partial_r=0.0, trail_k=2.0, trail_from="entry",   remainder_tp=False, time_stop=False),
+    ExitModel("I3_partial_chand3_eod", partial_r=1.0, trail_k=3.0, trail_from="partial", remainder_tp=False, time_stop=False),
+    ExitModel("I5_fixed1.5R_eod",      partial_r=0.0, trail_k=0.0, remainder_tp=True,  time_stop=False),   # tp passed as 1.5R by caller
+    ExitModel("I6_partialTP_eod",      partial_r=1.0, trail_k=0.0, remainder_tp=True,  time_stop=False),   # 50% at 1R, rest to 2R, BE
+    ExitModel("I4_partial_chand2_hold",partial_r=1.0, trail_k=2.0, trail_from="partial", remainder_tp=False, time_stop=False),   # NO eod flat
+]
+
 MODELS = [
     ExitModel("M0_current",            partial_r=0.0, trail_k=0.0, remainder_tp=True),
     ExitModel("M1_partial_fixedTP",    partial_r=1.0, trail_k=0.0, remainder_tp=True),
@@ -126,7 +136,7 @@ MODELS = [
 ]
 
 
-def label_event_v3(o, h, l, c, atr, time_ms, t, is_long, entry, stop0, tp, horizon_days, m: ExitModel, cost_bps=3.0):
+def label_event_v3(o, h, l, c, atr, time_ms, t, is_long, entry, stop0, tp, horizon_days, m: ExitModel, cost_bps=3.0, flat_at_idx=None):
     """Returns R (position-weighted, net of cost_bps per leg round trip), plus diagnostics.
     Long logic written once; shorts mirror via `sgn`."""
     n = len(c)
@@ -202,7 +212,9 @@ def label_event_v3(o, h, l, c, atr, time_ms, t, is_long, entry, stop0, tp, horiz
         if size_open <= 0:
             break
 
-        # --- time stop at this bar's close ---
+        # --- forced flat (intraday EOD) or time stop, at this bar's close ---
+        if flat_at_idx is not None and i >= flat_at_idx:
+            close_all(ci, "EOD_FLAT"); break
         if m.time_stop and time_ms[i] - time_ms[t] >= horizon_ms:
             close_all(ci, "TIME"); break
 

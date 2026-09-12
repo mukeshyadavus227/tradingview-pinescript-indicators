@@ -17,3 +17,5 @@ adaptive_scanner/research/out/final_*.csv
 adaptive_scanner/research/out/exit_events_*.csv
 __pycache__/
 .pytest_cache/
+# raw 15m CSVs are in flight during the fetch; the gzipped set is committed once complete
+adaptive_scanner/research/data_15m/*.csv
