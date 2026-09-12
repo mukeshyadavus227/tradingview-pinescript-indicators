@@ -109,6 +109,42 @@ SKILL.md. Rotate it, move it to an environment variable, and replace the literal
 in the skill with a placeholder. Do not paste the current or new value into any
 file in this repository.
 
+## 9. Lifecycle events and desired-state reconciliation (Phase 3)
+
+Schema 2.1.0 payloads carry `event`, `events[]` and a live `desired_state`.
+`action` is `BUY` on ENTRY and **`MANAGE`** on every other event.
+
+```python
+action: Literal["BUY", "SELL", "MANAGE"]
+event:  Literal["ENTRY", "SCALE", "MODIFY", "EXIT", "HEARTBEAT"] | None = None
+events: list[Event] | None = None
+desired_state: DesiredState | None = None   # side, entry_ref, risk, stop, size_pct_open,
+                                            # partial_at, partial_pct, trail{k, active, level},
+                                            # time_stop_at, bars_in_trade
+```
+
+Route by `event`, never by `action`:
+
+| event | server action |
+|---|---|
+| ENTRY | place entry + initial stop; for S3/S4 also a limit for `partial_pct` at `partial_at` |
+| SCALE | confirm the partial filled (or fill it at market if the limit was missed); move stop to `desired_state.stop` |
+| MODIFY | replace the working stop with `desired_state.stop` |
+| EXIT | flatten at market; reason in `events[].reason` |
+| HEARTBEAT | reconcile: if broker position ≠ `desired_state` (side, size_pct_open, stop within 1 tick), correct it |
+
+Reconciliation is idempotent and level-triggered, so a missed MODIFY is
+repaired by the next HEARTBEAT. Dedupe on `signal_id` (now
+`symbol|profile|bar_time|event|seq`).
+
+**Slot admission.** Under the portfolio heat cap, admit same-bar candidates
+by strategy priority S1 > S4 > S3 (the order of validated expectancy). Do not
+rank S3 candidates on score — it does not predict their outcome.
+
+**Until this item lands**, tell the operator to set the indicator's *Emit
+SCALE / MODIFY / EXIT events* input OFF; ENTRY payloads still carry the
+initial stop and the partial level in `comment`.
+
 ---
 
 ## Backward compatibility

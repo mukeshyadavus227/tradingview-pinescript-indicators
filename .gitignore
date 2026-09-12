@@ -12,3 +12,6 @@ _dev/
 # adaptive_scanner research: event tables are regenerable (python research/build_events.py) and ~20MB each
 adaptive_scanner/research/out/events_*.csv
 adaptive_scanner/research/__pycache__/
+adaptive_scanner/research/out/sim_*.csv
+adaptive_scanner/research/out/final_*.csv
+adaptive_scanner/research/out/exit_events_*.csv

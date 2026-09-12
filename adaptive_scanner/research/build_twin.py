@@ -59,34 +59,30 @@ EXEC_BLOCK = """
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║              STRATEGY EXECUTION  (twin only — appended by build_twin.py) ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-// Sizing: risk-based, mirroring the executor's equities formula
-//   shares = floor(max_risk / (price - stop)), max_risk = riskPct * equity.
-// Using default_qty_type=fixed with a computed qty keeps "1 unit = risk-sized
-// position" rather than "1 unit = 1 share", so the equity curve is in the same
-// units the live system would trade.
+// The shared exit engine above decides the levels; this block only places the
+// orders that realise them, so the twin's fills follow the same rules as the
+// validation labeller. Sizing is risk-based, mirroring the executor's equities
+// formula: shares = floor(max_risk / (price - stop)).
 bt_riskPct = input.float(1.5, "BT: risk % of equity per trade", minval = 0.1, maxval = 5.0, step = 0.1,
      group = "Backtest Twin")
-bt_useTimeStop = input.bool(true, "BT: enforce profile time stop", group = "Backtest Twin")
-bt_onlyWhenFlat = input.bool(true, "BT: take signals only when flat", group = "Backtest Twin",
-     tooltip = "ON matches pyramiding=0 and the parity test. The Python harness evaluates every signal independently as well; this twin is the sequential, single-position view.")
 
-bt_flat = strategy.position_size == 0
-bt_take = fireSignal and (not bt_onlyWhenFlat or bt_flat)
-bt_qty  = realRisk > 0 ? math.max(1, math.floor(strategy.equity * bt_riskPct / 100.0 / realRisk)) : 0
+bt_qty = realRisk > 0 ? math.max(1, math.floor(strategy.equity * bt_riskPct / 100.0 / realRisk)) : 0
 
-if bt_take and bt_qty > 0
-    if isLong
-        strategy.entry("L", strategy.long, qty = bt_qty, comment = stratTag(bestStrat) + " " + str.tostring(bestScore, "#"))
-        strategy.exit("L-x", "L", stop = stopPrice, limit = tpPrice, comment_loss = "SL", comment_profit = "TP")
-    else
-        strategy.entry("S", strategy.short, qty = bt_qty, comment = stratTag(bestStrat) + " " + str.tostring(bestScore, "#"))
-        strategy.exit("S-x", "S", stop = stopPrice, limit = tpPrice, comment_loss = "SL", comment_profit = "TP")
+if fireSignal and bt_qty > 0
+    strategy.entry("L", strategy.long, qty = bt_qty, comment = stratTag(bestStrat) + " " + str.tostring(bestScore, "#"))
 
-// Time stop: close at the first confirmed bar at or beyond the profile horizon.
-if bt_useTimeStop and strategy.opentrades > 0
-    bt_age = time - strategy.opentrades.entry_time(strategy.opentrades - 1)
-    if bt_age >= p_timeStopDays * 86400000
+// Re-issued every bar so the working stop follows the engine. Two exits: the
+// partial leg (limit + stop on exit_partialPct of the position) and the
+// remainder (stop only). Once the partial has filled only the remainder is live.
+if strategy.position_size > 0
+    if not posPartialDone and not na(posPartial)
+        strategy.exit("L-part", "L", qty_percent = exit_partialPct, limit = posPartial, stop = posStop, comment_profit = "PARTIAL", comment_loss = "SL")
+    strategy.exit("L-rest", "L", stop = posStop, comment_loss = posStop == posStop0 ? "SL" : posStop == posEntry ? "BE" : "TRAIL")
+    // S1 time stop, and a resync guard if the engine and the strategy ever disagree.
+    if posSide == 1 and posStrat == 1 and time - posEntryTime >= p_timeStopDays * 86400000
         strategy.close_all(comment = "TIME")
+    if posSide == 0
+        strategy.close_all(comment = "RESYNC")
 """
 
 

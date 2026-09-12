@@ -24,10 +24,27 @@ strategy("Adaptive Scanner Engine — BACKTEST TWIN", "ASR-BT", overlay = true,
      margin_long = 100, margin_short = 100)
 
 // ============================================================================
-// ADAPTIVE SCANNER ENGINE  v2.0.0-phase1
+// ADAPTIVE SCANNER ENGINE  v3.0.0
 // Successor to "Adaptive Swing Scanner v1.0".
 //
-// PHASE 1 SCOPE — correctness + payload repair only.
+// PHASE 3 — the rules the validation harness selected (see PHASE3_FINDINGS.md).
+//   S1  RSI mean reversion: fires on trigger AND trend component >= 18. No
+//       regime gate, no score threshold. SWING profile only. Exit: chandelier
+//       3xATR from entry, time stop kept, no partial, no fixed target.
+//   S2  Donchian breakout: REMOVED. No edge in the trigger (+0.08 R, CI spans 0).
+//   S3  EMA momentum: fires on trigger. No score threshold — the score does not
+//       predict its outcome; selection among simultaneous S3 candidates is the
+//       server's job. Exit: 50% at +1 R, breakeven, chandelier 3xATR on the
+//       remainder, NO time stop.
+//   S4  Multi-TF trend: unchanged, score >= 75 (the one place the rubric earned
+//       its keep). Exit: same as S3.
+//   Winner = highest-priority ELIGIBLE strategy, S1 > S4 > S3, by validated
+//       expectancy — not the max score. One position per chart at a time.
+//   Regime detector: computed and emitted as metadata; no longer a gate.
+//   Payload: one alert() per bar carrying an events[] list (ENTRY / SCALE /
+//       MODIFY / EXIT / HEARTBEAT) and the full desired_state, so the server
+//       reconciles against broker state rather than replaying deltas.
+//
 //   Profiles shipped:  SWING, POSITIONAL
 //   Profiles deferred: INTRADAY_15M / INTRADAY_5M (Phase 5, needs S5 ORB +
 //                      S6 VWAP-reclaim + time-of-day RVOL), LONGTERM (Phase 3,
@@ -106,20 +123,38 @@ isSwing     = profile == Profile.SWING
 profileStr  = isSwing ? "SWING" : "POSITIONAL"
 
 // Profile-resolved defaults. Operator overrides live in the groups below.
-p_minScore      = isSwing ?  75.0 :  70.0
 p_cooldownMin   = isSwing ?  7200 : 21600     // 5 days vs 15 trading days
-p_minRR         = isSwing ?   1.5 :   1.5     // see RISK LEVELS: guards S2's channel geometry, not the designed ATR ratios
+p_minRR         = 1.5                          // guards degenerate geometry only; S3/S4 designed ratios are 1.6-1.7
 p_atrStopMult   = isSwing ?   1.5 :   2.75
-p_timeStopDays  = isSwing ?    15 :    60
+p_timeStopDays  = isSwing ?    15 :    60      // S1 only in v3; S3/S4 have no time stop
+p_s1Enabled     = isSwing                      // S1 with wide POSITIONAL stops loses (+0.10 R, 32% hit); SWING only
+// S3 gating is profile-dependent: the score is not a predictor anywhere, but
+// under a portfolio slot cap it acts as a RATE LIMITER, and in POSITIONAL the
+// unthrottled S3 stream crowds out S4's longer, better trades. Resolved by the
+// slot-capped simulation in PHASE3_FINDINGS.md.
+p_s3Enabled     = isSwing or s3_inPositional
+p_s3EmitAll     = s3_gate <= 0.0
+s3_minScoreGate = s3_gate
 
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║                           MASTER CONTROLS                                ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-minScore        = input.float(0.0, "Min Conviction Score (0 = use profile default)",
-     minval = 0.0, maxval = 95.0, step = 1.0, group = "Master Controls")
-shortEnabled    = input.bool(false, "Enable Short Signals", group = "Master Controls")
-useRegimeFilter = input.bool(true, "Enforce Regime-Strategy Alignment", group = "Master Controls")
+s4_minScore     = input.float(75.0, "S4 min score (validated 70-75; degrades above 80)",
+     minval = 0.0, maxval = 95.0, step = 1.0, group = "Master Controls",
+     tooltip = "The only strategy whose score predicts outcome. Phase 2 sweep: >=60 +0.175 R, >=70 +0.193, >=75 +0.211, >=80 +0.157.")
+s1_trendGate    = input.float(18.0, "S1 trend-component gate (>= means above SMA200)",
+     minval = 0.0, maxval = 25.0, step = 1.0, group = "Master Controls",
+     tooltip = "S1 fires on trigger AND its own trend component >= this. 18 = above SMA200; 25 = SMA50 > SMA200 too. Replaces the regime gate that discarded 99.8% of S1's edge.")
+s3_gate         = input.float(70.0, "S3 score gate (rate limiter, not a predictor)",
+     minval = 0.0, maxval = 95.0, step = 1.0, group = "Master Controls",
+     tooltip = "The S3 score does not predict its outcome (Spearman +0.015), but under a portfolio slot cap the unthrottled S3 stream crowds out S4. At cap 10 the gate raised SWING Sharpe from 0.83 to 1.03. Set 0 only if you run more than ~20 concurrent slots.")
+s3_inPositional = input.bool(false, "Enable S3 in POSITIONAL (validated OFF)", group = "Master Controls",
+     tooltip = "POSITIONAL is S4-only by evidence: at cap 10, S4-only Sharpe 1.27 / max DD -11 R vs 1.03 / -20 R with S3. Turning S3 on buys capacity at the cost of Sharpe and drawdown.")
+shortEnabled    = input.bool(false, "Compute short scores (metadata only; never deployed)", group = "Master Controls",
+     tooltip = "Every strategy's short trigger tested negative. Short scores are still computed for the payload; selection is long-only.")
+useRegimeFilter = input.bool(false, "Enforce Regime-Strategy Alignment (validated OFF)", group = "Master Controls",
+     tooltip = "As a gate this blocked 84% of S1 triggers and added +0.01 R to S3. Regime is still computed and emitted as metadata.")
 cooldownMin     = input.int(0, "Cooldown (minutes, 0 = profile default)", minval = 0,
      group = "Master Controls",
      tooltip = "Wall-clock, not bars. v1 used bars, which meant 75 minutes on a 5m chart and three weeks on a daily chart from the same input.")
@@ -127,7 +162,6 @@ minRR           = input.float(0.0, "Minimum R:R to fire (0 = profile default)",
      minval = 0.0, maxval = 6.0, step = 0.1, group = "Master Controls",
      tooltip = "v1 computed rrRatio and never enforced it. S2's channel-derived stop can produce R:R below 1.")
 
-effMinScore  = minScore    > 0.0 ? minScore    : p_minScore
 effCooldown  = cooldownMin > 0   ? cooldownMin : p_cooldownMin
 effMinRR     = minRR       > 0.0 ? minRR       : p_minRR
 
@@ -182,10 +216,6 @@ s1_rsiLen     = input.int(14, "S1: RSI Length",      minval = 2,  maxval = 50, g
 s1_oversold   = input.int(30, "S1: Oversold",        minval = 10, maxval = 45, group = "S1 Mean Reversion")
 s1_overbought = input.int(70, "S1: Overbought",      minval = 55, maxval = 90, group = "S1 Mean Reversion")
 s1_supportLen = input.int(20, "S1: Support Lookback", minval = 5, maxval = 60, group = "S1 Mean Reversion")
-
-s2_entryLen = input.int(20, "S2: Entry Channel",     minval = 5,  maxval = 55,  group = "S2 Donchian Breakout")
-s2_trendSMA = input.int(50, "S2: Trend SMA",         minval = 20, maxval = 200, group = "S2 Donchian Breakout")
-s2_volMult  = input.float(1.3, "S2: Volume Spike x", minval = 1.0, maxval = 2.0, step = 0.1, group = "S2 Donchian Breakout")
 
 s3_fastEMA  = input.int(9,  "S3: Fast EMA",  minval = 3,  maxval = 30,  group = "S3 EMA/VWAP Momentum")
 s3_slowEMA  = input.int(21, "S3: Slow EMA",  minval = 10, maxval = 50,  group = "S3 EMA/VWAP Momentum")
@@ -461,8 +491,9 @@ s1_nearResist = ta.highest(high, s1_supportLen) - close < atr * 1.5
 s1_trigL      = s1_rsi < s1_oversold   and s1_nearSupp
 s1_trigS      = s1_rsi > s1_overbought and s1_nearResist
 
+s1_trendC    = aboveLT and ltUp ? 25.0 : aboveLT ? 18.0 : not na(dSma50) and close > dSma50 ? 10.0 : 0.0
 s1_scoreLong = f_rubric(s1_trigL,
-     (aboveLT and ltUp ? 25.0 : aboveLT ? 18.0 : not na(dSma50) and close > dSma50 ? 10.0 : 0.0),
+     s1_trendC,
      (s1_rsi < s1_oversold - 10 ? 25.0 : s1_rsi < s1_oversold - 5 ? 20.0 : 14.0),
      (nz(distFromHi, 50.0) > 50.0 ? 12.0 : nz(distFromHi, 50.0) > 30.0 ? 7.0 : 3.0) + (atrSane ? 8.0 : 0.0),
      volScore,
@@ -474,36 +505,6 @@ s1_scoreShort = f_rubric(s1_trigS,
      (nz(distFromLo, 50.0) > 50.0 ? 12.0 : nz(distFromLo, 50.0) > 30.0 ? 7.0 : 3.0) + (atrSane ? 8.0 : 0.0),
      volScore,
      (regimeMeanRev ? 15.0 : regime == 0 ? 8.0 : 0.0))
-
-// ── S2: Donchian Breakout ───────────────────────────────────────────────────
-s2_entryHigh = ta.highest(high, s2_entryLen)
-s2_entryLow  = ta.lowest(low,  s2_entryLen)
-s2_sma       = ta.sma(close, s2_trendSMA)
-s2_volSpike  = not na(volSMA20) and volume > volSMA20 * s2_volMult
-s2_chanH     = s2_entryHigh[1] - s2_entryLow[1]
-// Close beyond the channel, not merely a wick through it.
-s2_breakHi   = close > s2_entryHigh[1]
-s2_breakLo   = close < s2_entryLow[1]
-// Do not chase: block when price is already far beyond the trend SMA.
-s2_extUp     = not na(s2_sma) and close > s2_sma + atr * 1.5
-s2_extDn     = not na(s2_sma) and close < s2_sma - atr * 1.5
-s2_hasVol    = s2_volSpike or volAboveAvg
-s2_trigL     = s2_breakHi and not s2_extUp and s2_hasVol
-s2_trigS     = s2_breakLo and not s2_extDn and s2_hasVol
-
-s2_scoreLong = f_rubric(s2_trigL,
-     (not na(s2_sma) and close > s2_sma ? 12.0 : 0.0) + (aboveLT ? 8.0 : 0.0) + (ltUp ? 5.0 : 0.0),
-     (adxVal > adxTrendThr ? 18.0 : adxVal > adxRangeThr ? 10.0 : 0.0) + (diPlus > diMinus ? 7.0 : 0.0),
-     (atrExpanding ? 8.0 : 0.0) + (bbwExpanding ? 7.0 : 0.0) + (nz(distFromLo, 50.0) > 70.0 ? 5.0 : 0.0),
-     (s2_volSpike ? 15.0 : volAboveAvg ? 8.0 : 0.0),
-     (regimeBreakout ? 15.0 : regime == 4 ? 10.0 : regime == 0 ? 5.0 : 0.0))
-
-s2_scoreShort = f_rubric(s2_trigS,
-     (not na(s2_sma) and close < s2_sma ? 12.0 : 0.0) + (belowLT ? 8.0 : 0.0) + (ltDn ? 5.0 : 0.0),
-     (adxVal > adxTrendThr ? 18.0 : adxVal > adxRangeThr ? 10.0 : 0.0) + (diMinus > diPlus ? 7.0 : 0.0),
-     (atrExpanding ? 8.0 : 0.0) + (bbwExpanding ? 7.0 : 0.0) + (nz(distFromHi, 50.0) > 70.0 ? 5.0 : 0.0),
-     (s2_volSpike ? 15.0 : volAboveAvg ? 8.0 : 0.0),
-     (regimeBreakout ? 15.0 : regime == 4 ? 10.0 : regime == 0 ? 5.0 : 0.0))
 
 // ── S3: EMA / VWAP Momentum ─────────────────────────────────────────────────
 s3_fast  = ta.ema(close, s3_fastEMA)
@@ -574,43 +575,37 @@ s4_scoreShort = f_rubric(s4_trigS,
 
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║                  WINNER SELECTION  [F3]                                  ║
+// ║              WINNER SELECTION — priority by validated expectancy          ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-// The v1 bug: it computed bestLongScore and bestShortScore, took
-// bestDir = bestLongScore >= bestShortScore ? "BUY" : "SELL", and ONLY THEN
-// checked whether shorts were enabled — setting bestDirOk = false and
-// suppressing the entire bar. A stronger short therefore destroyed a valid
-// long instead of losing to it. Direction filtering now happens BEFORE argmax,
-// so a disabled direction can never veto an enabled one.
+// v2 took the max score across strategies. Phase 2 showed the scores are not
+// comparable predictors (S3's is noise, S1's is noise, S4's is weak), so the
+// argmax was choosing on decoration. Each strategy now has its OWN validated
+// gate, and the winner is the highest-priority eligible one — priority being
+// the order of measured expectancy: S1 (+0.47 R) > S4 (+0.21) > S3 (+0.15).
+// Long-only: every short trigger tested negative. Short scores remain
+// computed for the payload.
 s1_aligned = not useRegimeFilter or regime == 1 or regime == 0
-s2_aligned = not useRegimeFilter or regime == 2 or regime == 4 or regime == 0
 s3_aligned = not useRegimeFilter or regime == 3 or regime == 4 or regime == 0
 s4_aligned = not useRegimeFilter or regime == 4 or regime == 0
 
 s1L = s1_aligned ? s1_scoreLong : 0.0
-s2L = s2_aligned ? s2_scoreLong : 0.0
 s3L = s3_aligned ? s3_scoreLong : 0.0
 s4L = s4_aligned ? s4_scoreLong : 0.0
 s1S = shortEnabled and s1_aligned ? s1_scoreShort : 0.0
-s2S = shortEnabled and s2_aligned ? s2_scoreShort : 0.0
 s3S = shortEnabled and s3_aligned ? s3_scoreShort : 0.0
 s4S = shortEnabled and s4_aligned ? s4_scoreShort : 0.0
 
-bestLongScore = math.max(s1L, math.max(s2L, math.max(s3L, s4L)))
-bestLongStrat = bestLongScore <= 0.0 ? 0 :
-     bestLongScore == s1L ? 1 : bestLongScore == s2L ? 2 : bestLongScore == s3L ? 3 : 4
-bestShortScore = math.max(s1S, math.max(s2S, math.max(s3S, s4S)))
-bestShortStrat = bestShortScore <= 0.0 ? 0 :
-     bestShortScore == s1S ? 1 : bestShortScore == s2S ? 2 : bestShortScore == s3S ? 3 : 4
+s1_elig = p_s1Enabled and s1_aligned and s1_trigL and s1_trendC >= s1_trendGate
+s3_elig = p_s3Enabled and s3_aligned and s3_trigL and (p_s3EmitAll or s3_scoreLong >= s3_minScoreGate)
+s4_elig = s4_aligned and s4_trigL and s4_scoreLong >= s4_minScore
 
-isLong    = bestLongScore >= bestShortScore
-bestScore = isLong ? bestLongScore : bestShortScore
-bestStrat = isLong ? bestLongStrat : bestShortStrat
-bestDir   = isLong ? "BUY" : "SELL"
+bestStrat = s1_elig ? 1 : s4_elig ? 4 : s3_elig ? 3 : 0
+bestScore = bestStrat == 1 ? s1_scoreLong : bestStrat == 4 ? s4_scoreLong : bestStrat == 3 ? s3_scoreLong : 0.0
+isLong    = true
+bestDir   = "BUY"
 
-stratName(int id) => id == 1 ? "RSI_MeanReversion" : id == 2 ? "Donchian_Breakout" :
-     id == 3 ? "EMA_VWAP_Momentum" : id == 4 ? "MultiTF_Trend" : "None"
-stratTag(int id)  => id == 1 ? "MR" : id == 2 ? "BRK" : id == 3 ? "MOM" : id == 4 ? "MTF" : "--"
+stratName(int id) => id == 1 ? "RSI_MeanReversion" : id == 3 ? "EMA_VWAP_Momentum" : id == 4 ? "MultiTF_Trend" : "None"
+stratTag(int id)  => id == 1 ? "MR" : id == 3 ? "MOM" : id == 4 ? "MTF" : "--"
 
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
@@ -621,30 +616,30 @@ stratTag(int id)  => id == 1 ? "MR" : id == 2 ? "BRK" : id == 3 ? "MOM" : id == 
 // R:R gate would be circular and would pass by construction.
 //
 // The designed geometries are S1 1.2/~2.5, S2 channel-based, S3 1.8/3.0,
-// S4 2.5/4.0 — R:R of roughly 2.1, variable, 1.67 and 1.6. The R:R gate exists
-// to catch S2's degenerate cases (a wide channel stop against a narrow measured
-// move), NOT to veto S3/S4's designed ratios. Phase 2's harness found the first
-// draft doing exactly that: a 2.0 gate left SPY with one signal in twelve
-// years. The gate default is therefore 1.5, and the target scales with the
-// profile alongside the stop so POSITIONAL keeps the same geometry rather than
-// widening the stop into a sub-1.0 ratio.
+// S4 2.5/4.0 — R:R of roughly 2.1, 1.67 and 1.6. The gate default is 1.5: it
+// catches degenerate geometry only and never vetoes a designed ratio (a 2.0
+// gate in the first draft left SPY with one signal in twelve years). The
+// target scales with the profile alongside the stop.
+//
+// In v3 the fixed target is only the INITIAL bracket. The exit engine below
+// replaces it: S1 trails a 3xATR chandelier from entry with the profile time
+// stop; S3/S4 take 50% at +1 R, move to breakeven, and trail the remainder
+// with no time stop. `tpPrice` remains in the payload as the partial level
+// (S3/S4) or the reference target (S1).
 stopScale = effAtrStop / 1.5
 tpScale   = stopScale
 
 s1_stopD = atr * 1.20 * stopScale
-s2_stopD = math.max(atr * 0.80 * stopScale,
-     (isLong ? math.abs(close - s2_entryHigh[1]) : math.abs(s2_entryLow[1] - close)) + atr * 0.30)
 s3_stopD = atr * 1.80 * stopScale
 s4_stopD = atr * 2.50 * stopScale
-stopDist = bestStrat == 1 ? s1_stopD : bestStrat == 2 ? s2_stopD : bestStrat == 3 ? s3_stopD : s4_stopD
+stopDist = bestStrat == 1 ? s1_stopD : bestStrat == 3 ? s3_stopD : s4_stopD
 
-// Targets: S1 reverts to the band mid / prior extreme, S2 takes the measured
-// move of the channel it broke, S3 and S4 use ATR projections sized to horizon.
+// Reference targets (S1: band mid / prior extreme; S3, S4: ATR projections).
+// For S3/S4 the deployed partial level is +1 R, computed in the exit engine.
 s1_tpD = math.min(math.max(math.abs(nz(bbMid, close) - close), atr * 1.5 * tpScale), atr * 4.0 * tpScale)
-s2_tpD = math.max(nz(s2_chanH, atr * 2.0 * tpScale), atr * 1.5 * tpScale)
 s3_tpD = atr * 3.0 * tpScale
 s4_tpD = atr * 4.0 * tpScale
-tpDist = bestStrat == 1 ? s1_tpD : bestStrat == 2 ? s2_tpD : bestStrat == 3 ? s3_tpD : s4_tpD
+tpDist = bestStrat == 1 ? s1_tpD : bestStrat == 3 ? s3_tpD : s4_tpD
 
 // [F8] Round to mintick BEFORE measuring R:R, so the gate tests the price that
 // will actually be worked at the broker. v1 emitted unrounded prices, which
@@ -657,6 +652,45 @@ realRwd   = math.abs(tpPrice  - entryRef)
 rrRatio   = realRisk > 0 ? realRwd / realRisk : 0.0
 rrOk      = rrRatio >= effMinRR                      // [F7] now enforced
 stopPct   = close > 0 ? realRisk / close * 100.0 : 0.0
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                     EXIT ENGINE — state                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// The one place the indicator carries state: the position it last ENTERED,
+// managed bar by bar with the same fill rules as the validation labeller
+// (research/labels.py: label_event_v3). This is not a claim about broker
+// state — the server reconciles `desired_state` against IBKR — it is the
+// engine's declaration of what the position should look like now.
+//
+// Exit models selected in the Phase 3 study (train 2015-20, confirmed 2021+):
+//   S1      chandelier k*ATR from entry, no partial, profile time stop kept
+//   S3, S4  50% off at +1 R, stop to breakeven, chandelier k*ATR on the
+//           remainder, no fixed target, NO time stop
+exit_trailK     = input.float(3.0, "Chandelier trail (x ATR)", minval = 1.0, maxval = 6.0, step = 0.5, group = "Exit Engine",
+     tooltip = "3.0 selected on train Sharpe; 2.0 exits too early on every strategy, 4.0 collapses out of sample for S1.")
+exit_partialR   = input.float(1.0, "S3/S4 partial at (R)", minval = 0.5, maxval = 3.0, step = 0.25, group = "Exit Engine")
+exit_partialPct = input.int(50, "S3/S4 partial size (%)", minval = 10, maxval = 90, step = 10, group = "Exit Engine")
+emitHeartbeat   = input.bool(true, "Heartbeat: emit desired_state every bar while in a position", group = "Exit Engine",
+     tooltip = "Level-triggered in addition to edge-triggered, so a missed MODIFY self-heals within one bar. The server dedupes on idempotency_key.")
+emitLifecycle   = input.bool(true, "Emit SCALE / MODIFY / EXIT events (requires patched server)", group = "Exit Engine",
+     tooltip = "Lifecycle payloads carry action=MANAGE, which the UNPATCHED TVSignal model rejects (Literal BUY|SELL) — a safe failure, but noisy. Turn OFF until SERVER_PATCH.md item 9 is applied; ENTRY payloads still carry the initial stop.")
+
+var int   posSide        = 0        // 0 flat, 1 long (long-only engine)
+var int   posStrat       = 0
+var float posEntry       = na
+var float posRisk        = na
+var float posStop0       = na       // initial stop
+var float posStop        = na       // working stop: initial → breakeven → trailed
+var float posPartial     = na       // +R partial level (S3/S4), na for S1
+var float posExtreme     = na       // highest high since entry
+var bool  posPartialDone = false
+var bool  posTrailOn     = false
+var bool  posPendingBE   = false
+var int   posEntryTime   = 0
+var int   posEntryBar    = 0
+var float posSizePct     = 0.0      // % of original size still open
+var int   posEvents      = 0        // lifecycle events emitted for this position
 
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
@@ -683,8 +717,106 @@ liquidityOk = (minDollarVol <= 0.0 or (not na(dAdvUsd) and dAdvUsd >= minDollarV
 var int lastSigTime = 0
 cooldownOk = lastSigTime == 0 or (time - lastSigTime) >= effCooldown * 60000
 
-fireSignal = barstate.isconfirmed and warmupOk and bestStrat > 0 and bestScore >= effMinScore and
+fireSignal = barstate.isconfirmed and warmupOk and bestStrat > 0 and posSide == 0 and
      rrOk and liquidityOk and inSession and lastBarOk and hourOk and cooldownOk
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                     EXIT ENGINE — per-bar update                          ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// Order within a bar mirrors the broker emulator: gap fills at the open, then
+// intrabar stop/target with the open→high→low vs open→low→high rule when both
+// are inside the range, then the time stop at the close, then close-of-bar
+// stop management that takes effect NEXT bar.
+evEntry   = false
+evPartial = false
+evExit    = false
+evModify  = false
+float evExitPx  = na
+evExitWhy = ""
+float evFillPx  = na
+stopBefore = posStop
+
+if barstate.isconfirmed and posSide == 1 and bar_index > posEntryBar
+    stopHit = low  <= posStop
+    stopGap = open <= posStop
+    tgtAct  = not posPartialDone and not na(posPartial)
+    tgtHit  = tgtAct and high >= posPartial
+    tgtGap  = tgtAct and open >= posPartial
+    whyStop = posStop == posStop0 ? "SL" : posStop == posEntry ? "BE" : "TRAIL"
+
+    if stopGap
+        evExit := true
+        evExitPx := open
+        evExitWhy := whyStop + "_GAP"
+    else if tgtGap
+        evPartial := true
+        evFillPx := open
+    else if stopHit and tgtHit
+        highFirst = math.abs(high - open) < math.abs(open - low)
+        if highFirst
+            evPartial := true
+            evFillPx := posPartial
+            evExit := true
+            evExitPx := posStop
+            evExitWhy := whyStop      // remainder stopped later in the bar
+        else
+            evExit := true
+            evExitPx := posStop
+            evExitWhy := whyStop
+    else if stopHit
+        evExit := true
+        evExitPx := posStop
+        evExitWhy := whyStop
+    else if tgtHit
+        evPartial := true
+        evFillPx := posPartial
+
+    if evPartial
+        posPartialDone := true
+        posSizePct     := posSizePct - exit_partialPct
+        posPendingBE   := true
+        posTrailOn     := true
+
+    // S1 keeps the profile time stop; S3/S4 do not.
+    if not evExit and posStrat == 1 and time - posEntryTime >= p_timeStopDays * 86400000
+        evExit := true
+        evExitPx := close
+        evExitWhy := "TIME"
+
+    if evExit
+        posSide := 0
+        posSizePct := 0.0
+    else
+        // close-of-bar management, effective next bar
+        if posPendingBE
+            posStop      := math.max(posStop, posEntry)
+            posPendingBE := false
+        posExtreme := math.max(nz(posExtreme, high), high)
+        if posTrailOn and not na(atr)
+            posStop := math.max(posStop, math.round_to_mintick(posExtreme - exit_trailK * atr))
+        evModify := posStop != stopBefore
+
+if fireSignal
+    posSide        := 1
+    posStrat       := bestStrat
+    posEntry       := entryRef
+    posRisk        := realRisk
+    posStop0       := stopPrice
+    posStop        := stopPrice
+    posPartial     := bestStrat == 1 ? na : math.round_to_mintick(entryRef + exit_partialR * realRisk)
+    posExtreme     := entryRef                // labeller seeds the chandelier extreme at the entry close
+    posPartialDone := bestStrat == 1
+    posTrailOn     := bestStrat == 1          // S1 trails from entry; S3/S4 after the partial
+    posPendingBE   := false
+    posEntryTime   := time
+    posEntryBar    := bar_index
+    posSizePct     := 100.0
+    posEvents      := 0
+    evEntry        := true
+
+anyEvent  = evEntry or (emitLifecycle and (evPartial or evExit or evModify))
+heartbeat = emitHeartbeat and emitLifecycle and barstate.isconfirmed and posSide == 1 and not anyEvent
 
 // Composite score for cross-sectional ranking server-side. S1 wants distance
 // FROM the 52-week high (room to revert); the trend strategies want proximity
@@ -702,8 +834,9 @@ compositeScore = bestScore * 0.50 + regimeConf * 0.20 + nz(rvPctile, 50.0) * 0.1
 // capital at risk. Emitting it is the fix. Emitting a SCORE-DERIVED value is a
 // separate decision that must wait for Phase 2 — an unvalidated rubric should
 // not be choosing position size. Default OFF reproduces today's flat 1.5%.
+scoreFloor = bestStrat == 4 ? s4_minScore : 0.0
 confRaw = useScoreConfidence ?
-     confAtMin + (bestScore - effMinScore) / math.max(1.0, 100.0 - effMinScore) * (confAtMax - confAtMin) :
+     confAtMin + (bestScore - scoreFloor) / math.max(1.0, 100.0 - scoreFloor) * (confAtMax - confAtMin) :
      confFlat
 confidence = math.min(0.99, math.max(0.31, confRaw))
 
@@ -732,7 +865,27 @@ f2(float v) => str.tostring(v, "0.##")
 f1(float v) => str.tostring(v, "0.#")
 
 var int sigSeq = 0
-signalId = safeTicker + "|" + profileStr + "|" + str.tostring(time) + "|" + str.tostring(sigSeq)
+evKind   = evEntry ? "ENTRY" : evExit ? "EXIT" : evPartial ? "SCALE" : evModify ? "MODIFY" : "HEARTBEAT"
+signalId = safeTicker + "|" + profileStr + "|" + str.tostring(time) + "|" + evKind + "|" + str.tostring(sigSeq)
+// ENTRY is a BUY the current TVSignal model understands. Lifecycle events are
+// MANAGE: the unpatched model rejects that literal outright, which is the safe
+// failure — a SELL would have opened a short.
+payloadAction = evEntry ? "BUY" : "MANAGE"
+
+eventsJson = "[" +
+     (evEntry   ? '{"type":"ENTRY","price":' + f2(entryRef) + ',"stop":' + f2(stopPrice) +
+                  (bestStrat == 1 ? "" : ',"partial_at":' + f2(posPartial) + ',"partial_pct":' + str.tostring(exit_partialPct)) + '}' : "") +
+     (evPartial ? (evEntry ? "," : "") + '{"type":"SCALE","price":' + f2(evFillPx) + ',"pct":' + str.tostring(exit_partialPct) + '}' : "") +
+     (evExit    ? ((evEntry or evPartial) ? "," : "") + '{"type":"EXIT","price":' + f2(evExitPx) + ',"reason":"' + evExitWhy + '"}' : "") +
+     (evModify and not evExit ? ((evEntry or evPartial) ? "," : "") + '{"type":"MODIFY","stop":' + f2(posStop) + ',"from":' + f2(nz(stopBefore)) + '}' : "") +
+     (heartbeat ? '{"type":"HEARTBEAT"}' : "") +
+     "]"
+
+dsSide    = posSide == 1 ? "LONG" : "FLAT"
+dsStopStr = posSide == 1 ? f2(posStop) : "null"
+dsPartStr = posSide == 1 and not na(posPartial) and not posPartialDone ? f2(posPartial) : "null"
+dsTrailStr = posSide == 1 and posTrailOn ? f2(nz(posExtreme) - exit_trailK * atr) : "null"
+dsTimeStop = posSide == 1 and posStrat == 1 ? str.tostring(posEntryTime + p_timeStopDays * 86400000) : "null"
 
 // Compact digest for the `comment` field — the one free-text channel that
 // reaches the executor on an unpatched server.
@@ -741,18 +894,19 @@ digest = "ASR2|" + profileStr + "|" + stratTag(bestStrat) +
      "|rr=" + f1(rrRatio) + "|sl=" + f2(stopPrice) + "|tp=" + f2(tpPrice) +
      "|rg=" + regimeStr + "|rv=" + f1(nz(rvPctile, 50.0)) + "|cmp=" + f1(compositeScore)
 
-timeStopAt = time + p_timeStopDays * 86400000
 
 payload =
  '{' +
-   '"schema_version":"2.0.0",' +
+   '"schema_version":"2.1.0",' +
    '"signal_id":"' + signalId + '",' +
    '"profile":"' + profileStr + '",' +
    '"account_route":"' + accountRoute + '",' +
    '"manual_only":' + (accountRoute == "FIDELITY_403B_MANUAL" ? "true" : "false") + ',' +
    // --- fields the current TVSignal model already accepts ---
    '"symbol":"' + safeTicker + '",' +
-   '"action":"' + bestDir + '",' +
+   '"action":"' + payloadAction + '",' +
+   '"event":"' + evKind + '",' +
+   '"events":' + eventsJson + ','
    '"qty":1,' +
    '"order_type":"MKT",' +
    '"price":' + f2(entryRef) + ',' +
@@ -770,12 +924,18 @@ payload =
      '"expected_move_atr":' + f2(atr > 0 ? tpDist / atr : 0.0) +
    '},' +
    '"desired_state":{' +
-     '"side":"' + (isLong ? "LONG" : "SHORT") + '",' +
-     '"entry_ref":' + f2(entryRef) + ',' +
-     '"stop":' + f2(stopPrice) + ',' +
-     '"targets":[{"price":' + f2(tpPrice) + ',"fraction":0.5}],' +
-     '"time_stop_at":' + str.tostring(timeStopAt) + ',' +
-     '"invalidate_if":"regime_leaves:' + regimeStr + '"' +
+     '"side":"' + dsSide + '",' +
+     '"strategy":"' + stratName(posSide == 1 ? posStrat : bestStrat) + '",' +
+     '"entry_ref":' + (posSide == 1 ? f2(posEntry) : f2(entryRef)) + ',' +
+     '"risk":' + (posSide == 1 ? f2(posRisk) : f2(realRisk)) + ',' +
+     '"stop":' + dsStopStr + ',' +
+     '"size_pct_open":' + str.tostring(posSizePct, "0") + ',' +
+     '"partial_at":' + dsPartStr + ',' +
+     '"partial_pct":' + str.tostring(exit_partialPct) + ',' +
+     '"trail":{"type":"CHANDELIER_ATR","k":' + str.tostring(exit_trailK, "0.#") + ',"active":' + (posTrailOn and posSide == 1 ? "true" : "false") + ',"level":' + dsTrailStr + '},' +
+     '"breakeven_after_partial":true,' +
+     '"time_stop_at":' + dsTimeStop + ',' +
+     '"bars_in_trade":' + str.tostring(posSide == 1 ? bar_index - posEntryBar : 0) +
    '},' +
    '"sizing":{' +
      '"stop_distance":' + f2(realRisk) + ',' +
@@ -789,7 +949,6 @@ payload =
      '"composite":' + f1(compositeScore) + ',' +
      '"winner":"' + stratTag(bestStrat) + '",' +
      '"s1":' + f1(math.max(s1L, s1S)) + ',' +
-     '"s2":' + f1(math.max(s2L, s2S)) + ',' +
      '"s3":' + f1(math.max(s3L, s3S)) + ',' +
      '"s4":' + f1(math.max(s4L, s4S)) + ',' +
      '"calibrated":false' +
@@ -829,81 +988,30 @@ payload =
      '"warmup_ok":true,' +
      '"bars_per_day":' + f2(bpd) + ',' +
      '"bpd_drift_pct":' + f1(bpdDrift) + ',' +
-     '"script_version":"2.0.0-phase1"' +
+     '"script_version":"3.0.0"' +
    '}' +
  '}'
 
 if fireSignal
     lastSigTime := time
-    sigSeq      += 1
+if anyEvent or heartbeat
+    sigSeq += 1
     alert(payload, alert.freq_once_per_bar_close)
 
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║                        VISUALIZATION  [F11]                              ║
+// ║                        VISUALIZATION                                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-// v1 maintained entryPrice / entryDir / slLevel / tpLevel and a live P&L row,
-// as if the indicator knew the broker's state. It did not: it never saw a fill,
-// a partial, a slip or a manual override, and when both the stop and the target
-// were touched inside one bar it resolved the ambiguity arbitrarily and then
-// reported a P&L from it. All of that is removed. What remains is a truthful
-// record of what this script last EMITTED, labelled as reference levels.
-var float refEntry = na
-var float refStop  = na
-var float refTp    = na
-var int   refDir   = 0
-var int   refBar   = na
-var string refTag  = ""
-var line  lnE = na
-var line  lnS = na
-var line  lnT = na
-var label lbS = na
-var label lbT = na
-
-if fireSignal and showLevels
-    refEntry := entryRef
-    refStop  := stopPrice
-    refTp    := tpPrice
-    refDir   := isLong ? 1 : -1
-    refBar   := bar_index
-    refTag   := stratTag(bestStrat)
-    if not na(lnE)
-        line.delete(lnE)
-    if not na(lnS)
-        line.delete(lnS)
-    if not na(lnT)
-        line.delete(lnT)
-    if not na(lbS)
-        label.delete(lbS)
-    if not na(lbT)
-        label.delete(lbT)
-    lnE := line.new(bar_index, refEntry, bar_index + 20, refEntry, color = color.white,  width = 1, style = line.style_dotted)
-    lnS := line.new(bar_index, refStop,  bar_index + 20, refStop,  color = color.red,    width = 2)
-    lnT := line.new(bar_index, refTp,    bar_index + 20, refTp,    color = color.green,  width = 2)
-    lbS := label.new(bar_index + 21, refStop, "ref SL " + str.tostring(refStop, "0.##"),
-         color = color.new(color.red, 80), textcolor = color.red, style = label.style_label_left, size = size.tiny)
-    lbT := label.new(bar_index + 21, refTp, "ref TP " + str.tostring(refTp, "0.##") + "  R:R " + str.tostring(rrRatio, "0.#"),
-         color = color.new(color.green, 80), textcolor = color.green, style = label.style_label_left, size = size.tiny)
-
-// Whether price has since traded through a reference level. This describes the
-// CHART, not a position — no fill is implied and no P&L is claimed.
-refStopTouched = (refDir ==  1 and not na(refStop) and low  <= refStop) or
-                 (refDir == -1 and not na(refStop) and high >= refStop)
-refTpTouched   = (refDir ==  1 and not na(refTp)   and high >= refTp) or
-                 (refDir == -1 and not na(refTp)   and low  <= refTp)
-var string refOutcome = "—"
-if refStopTouched and refOutcome == "—"
-    refOutcome := "SL touched"
-if refTpTouched and refOutcome == "—"
-    refOutcome := "TP touched"
-if fireSignal
-    refOutcome := "open"
+// What is drawn is the exit engine's live state — the entry it declared, the
+// stop it is working now, and the partial level until it fills. Nothing here
+// is broker state; it is the same desired_state the payload carries.
+plot(posSide == 1 ? posEntry : na,   "Entry (engine)",        color = color.new(color.white, 30), style = plot.style_linebr, linewidth = 1)
+plot(posSide == 1 ? posStop : na,    "Working stop (engine)", color = posTrailOn ? color.new(color.orange, 0) : color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(posSide == 1 and not posPartialDone ? posPartial : na, "Partial level (engine)", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 1)
 
 plot(dSma200, "SMA200 (daily ctx)", color = color.new(color.gray, 20), linewidth = 1)
 plot(s3_fast, "EMA Fast",  color = color.new(color.blue, 40))
 plot(s3_slow, "EMA Slow",  color = color.new(color.orange, 40))
-plot(s2_entryHigh, "DC High", color = color.new(color.green, 70))
-plot(s2_entryLow,  "DC Low",  color = color.new(color.red, 70))
 
 plotshape(fireSignal and isLong  and not showStratLabel, "Long",  shape.triangleup,
      location.belowbar, color.green, size = size.small)
@@ -927,7 +1035,7 @@ bgcolor(showRegimeBG ? (regime == 4 ? color.new(color.green, 96) : regime == 2 ?
 // at a quiet chart.
 blockReason = not warmupOk           ? "WARMUP"      :
      bestStrat == 0                  ? "NO SETUP"    :
-     bestScore < effMinScore         ? "SCORE"       :
+     posSide != 0                    ? "IN POSITION" :
      not rrOk                        ? "R:R"         :
      not liquidityOk                 ? "LIQUIDITY"   :
      not inSession                   ? "SESSION"     :
@@ -955,30 +1063,28 @@ if barstate.islast and showDash
     table.cell(tbl, 3, 1, "2nd " + regime2Str, text_color = color.gray, text_size = size.tiny)
 
     table.cell(tbl, 0, 2, "S1 MeanRev",  bgcolor = color.new(color.purple, 50), text_color = color.white, text_size = size.small)
-    table.cell(tbl, 1, 2, s1L > s1S ? "LONG" : s1S > 0 ? "SHORT" : "—", text_color = s1L > s1S ? okCol : s1S > 0 ? color.red : noCol, text_size = size.small)
-    table.cell(tbl, 2, 2, str.tostring(math.max(s1L, s1S), "#"), text_color = math.max(s1L, s1S) >= effMinScore ? okCol : noCol, text_size = size.small)
-    table.cell(tbl, 3, 2, s1_aligned ? "aligned" : "blocked", text_color = s1_aligned ? okCol : color.red, text_size = size.tiny)
+    table.cell(tbl, 1, 2, s1_trigL ? "TRIG" : "—", text_color = s1_trigL ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 2, 2, "trend " + str.tostring(s1_trendC, "#") + "/" + str.tostring(s1_trendGate, "#"), text_color = s1_trendC >= s1_trendGate ? okCol : noCol, text_size = size.tiny)
+    table.cell(tbl, 3, 2, not p_s1Enabled ? "off (profile)" : s1_elig ? "ELIGIBLE" : "—", text_color = s1_elig ? okCol : noCol, text_size = size.tiny)
 
-    table.cell(tbl, 0, 3, "S2 Breakout", bgcolor = color.new(color.yellow, 50), text_color = color.black, text_size = size.small)
-    table.cell(tbl, 1, 3, s2L > s2S ? "LONG" : s2S > 0 ? "SHORT" : "—", text_color = s2L > s2S ? okCol : s2S > 0 ? color.red : noCol, text_size = size.small)
-    table.cell(tbl, 2, 3, str.tostring(math.max(s2L, s2S), "#"), text_color = math.max(s2L, s2S) >= effMinScore ? okCol : noCol, text_size = size.small)
-    table.cell(tbl, 3, 3, s2_aligned ? "aligned" : "blocked", text_color = s2_aligned ? okCol : color.red, text_size = size.tiny)
+    table.cell(tbl, 0, 3, "S3 Momentum", bgcolor = color.new(color.blue, 50), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 3, s3_trigL ? "TRIG" : "—", text_color = s3_trigL ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 2, 3, str.tostring(s3_scoreLong, "#") + (p_s3EmitAll ? " (meta)" : "/" + str.tostring(s3_minScoreGate, "#")), text_color = color.gray, text_size = size.tiny)
+    table.cell(tbl, 3, 3, s3_elig ? "ELIGIBLE" : "—", text_color = s3_elig ? okCol : noCol, text_size = size.tiny)
 
-    table.cell(tbl, 0, 4, "S3 Momentum", bgcolor = color.new(color.blue, 50), text_color = color.white, text_size = size.small)
-    table.cell(tbl, 1, 4, s3L > s3S ? "LONG" : s3S > 0 ? "SHORT" : "—", text_color = s3L > s3S ? okCol : s3S > 0 ? color.red : noCol, text_size = size.small)
-    table.cell(tbl, 2, 4, str.tostring(math.max(s3L, s3S), "#"), text_color = math.max(s3L, s3S) >= effMinScore ? okCol : noCol, text_size = size.small)
-    table.cell(tbl, 3, 4, s3_aligned ? "aligned" : "blocked", text_color = s3_aligned ? okCol : color.red, text_size = size.tiny)
+    table.cell(tbl, 0, 4, "S4 MTF",      bgcolor = color.new(color.teal, 50), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 4, s4_trigL ? "TRIG" : "—", text_color = s4_trigL ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 2, 4, str.tostring(s4_scoreLong, "#") + "/" + str.tostring(s4_minScore, "#"), text_color = s4_scoreLong >= s4_minScore ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 3, 4, s4_elig ? "ELIGIBLE" : "—", text_color = s4_elig ? okCol : noCol, text_size = size.tiny)
 
-    table.cell(tbl, 0, 5, "S4 MTF",      bgcolor = color.new(color.teal, 50), text_color = color.white, text_size = size.small)
-    table.cell(tbl, 1, 5, s4L > s4S ? "LONG" : s4S > 0 ? "SHORT" : "—", text_color = s4L > s4S ? okCol : s4S > 0 ? color.red : noCol, text_size = size.small)
-    table.cell(tbl, 2, 5, str.tostring(math.max(s4L, s4S), "#"), text_color = math.max(s4L, s4S) >= effMinScore ? okCol : noCol, text_size = size.small)
-    table.cell(tbl, 3, 5, s4_aligned ? "aligned" : "blocked", text_color = s4_aligned ? okCol : color.red, text_size = size.tiny)
+    table.cell(tbl, 0, 5, "Shorts", bgcolor = color.new(color.gray, 50), text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 5, shortEnabled ? "meta only" : "off", text_color = noCol, text_size = size.tiny)
+    table.cell(tbl, 2, 5, shortEnabled ? str.tostring(math.max(s1S, math.max(s3S, s4S)), "#") : "", text_color = noCol, text_size = size.tiny)
+    table.cell(tbl, 3, 5, "never deployed", text_color = noCol, text_size = size.tiny)
 
     table.cell(tbl, 0, 6, "WINNER", bgcolor = color.navy, text_color = color.white, text_size = size.small)
-    table.cell(tbl, 1, 6, bestStrat > 0 ? stratTag(bestStrat) + " " + bestDir : "—",
-         text_color = bestScore >= effMinScore ? okCol : noCol, text_size = size.small)
-    table.cell(tbl, 2, 6, str.tostring(bestScore, "#") + "/" + str.tostring(effMinScore, "#"),
-         text_color = bestScore >= effMinScore ? okCol : color.red, text_size = size.small)
+    table.cell(tbl, 1, 6, bestStrat > 0 ? stratTag(bestStrat) + " BUY" : "—", text_color = bestStrat > 0 ? okCol : noCol, text_size = size.small)
+    table.cell(tbl, 2, 6, bestStrat > 0 ? "score " + str.tostring(bestScore, "#") : "", text_color = color.gray, text_size = size.tiny)
     table.cell(tbl, 3, 6, "comp " + str.tostring(compositeScore, "0.#"), text_color = color.yellow, text_size = size.tiny)
 
     table.cell(tbl, 0, 7, "BLOCK", bgcolor = color.maroon, text_color = color.white, text_size = size.small)
@@ -989,8 +1095,11 @@ if barstate.islast and showDash
          text_color = useScoreConfidence ? color.orange : color.gray, text_size = size.tiny)
 
     table.cell(tbl, 0, 8, "Risk", bgcolor = color.navy, text_color = color.white, text_size = size.small)
-    table.cell(tbl, 1, 8, "SL " + str.tostring(stopPrice, "0.##"), text_color = color.orange, text_size = size.tiny)
-    table.cell(tbl, 2, 8, "TP " + str.tostring(tpPrice, "0.##"),   text_color = color.green,  text_size = size.tiny)
+    table.cell(tbl, 1, 8, (posSide == 1 ? "stop " : "SL ") + str.tostring(posSide == 1 ? posStop : stopPrice, "0.##"),
+         text_color = posSide == 1 and posTrailOn ? color.orange : color.red, text_size = size.tiny)
+    table.cell(tbl, 2, 8, posSide == 1 ? (posPartialDone ? "partial done" : "partial " + str.tostring(posPartial, "0.##")) :
+         (bestStrat == 1 ? "ref TP " + str.tostring(tpPrice, "0.##") : "partial +" + str.tostring(exit_partialR, "0.#") + "R"),
+         text_color = color.green, text_size = size.tiny)
     table.cell(tbl, 3, 8, "R:R " + str.tostring(rrRatio, "0.#") + " / " + str.tostring(effMinRR, "0.#") +
          "  " + str.tostring(stopPct, "0.#") + "%",
          text_color = rrOk ? okCol : color.red, text_size = size.tiny)
@@ -1022,42 +1131,39 @@ if barstate.islast and showDash
     table.cell(tbl, 2, 13, "of " + str.tostring(effCooldown) + "m", text_color = color.gray, text_size = size.tiny)
     table.cell(tbl, 3, 13, "signals " + str.tostring(sigSeq), text_color = color.gray, text_size = size.tiny)
 
-    table.cell(tbl, 0, 14, "Last emitted", bgcolor = color.black, text_color = color.white, text_size = size.small)
-    table.cell(tbl, 1, 14, refDir == 0 ? "none" : (refDir == 1 ? "LONG " : "SHORT ") + refTag,
-         text_color = refDir == 1 ? okCol : refDir == -1 ? color.red : noCol, text_size = size.tiny)
-    table.cell(tbl, 2, 14, na(refEntry) ? "" : str.tostring(refEntry, "0.##") +
-         (na(refBar) ? "" : "  " + str.tostring(bar_index - refBar) + "b"), text_color = color.white, text_size = size.tiny)
-    table.cell(tbl, 3, 14, refOutcome + " (chart, not broker)", text_color = color.gray, text_size = size.tiny)
+    table.cell(tbl, 0, 14, "Position", bgcolor = color.black, text_color = color.white, text_size = size.small)
+    table.cell(tbl, 1, 14, posSide == 1 ? "LONG " + stratTag(posStrat) + " " + str.tostring(posSizePct, "0") + "%" : "FLAT",
+         text_color = posSide == 1 ? okCol : noCol, text_size = size.tiny)
+    table.cell(tbl, 2, 14, posSide == 1 ? "@ " + str.tostring(posEntry, "0.##") + "  " + str.tostring(bar_index - posEntryBar) + "b" : "",
+         text_color = color.white, text_size = size.tiny)
+    table.cell(tbl, 3, 14, posSide == 1 ? (posTrailOn ? "trailing" : "initial stop") + " (engine, not broker)" : "",
+         text_color = color.gray, text_size = size.tiny)
 
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║              STRATEGY EXECUTION  (twin only — appended by build_twin.py) ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-// Sizing: risk-based, mirroring the executor's equities formula
-//   shares = floor(max_risk / (price - stop)), max_risk = riskPct * equity.
-// Using default_qty_type=fixed with a computed qty keeps "1 unit = risk-sized
-// position" rather than "1 unit = 1 share", so the equity curve is in the same
-// units the live system would trade.
+// The shared exit engine above decides the levels; this block only places the
+// orders that realise them, so the twin's fills follow the same rules as the
+// validation labeller. Sizing is risk-based, mirroring the executor's equities
+// formula: shares = floor(max_risk / (price - stop)).
 bt_riskPct = input.float(1.5, "BT: risk % of equity per trade", minval = 0.1, maxval = 5.0, step = 0.1,
      group = "Backtest Twin")
-bt_useTimeStop = input.bool(true, "BT: enforce profile time stop", group = "Backtest Twin")
-bt_onlyWhenFlat = input.bool(true, "BT: take signals only when flat", group = "Backtest Twin",
-     tooltip = "ON matches pyramiding=0 and the parity test. The Python harness evaluates every signal independently as well; this twin is the sequential, single-position view.")
 
-bt_flat = strategy.position_size == 0
-bt_take = fireSignal and (not bt_onlyWhenFlat or bt_flat)
-bt_qty  = realRisk > 0 ? math.max(1, math.floor(strategy.equity * bt_riskPct / 100.0 / realRisk)) : 0
+bt_qty = realRisk > 0 ? math.max(1, math.floor(strategy.equity * bt_riskPct / 100.0 / realRisk)) : 0
 
-if bt_take and bt_qty > 0
-    if isLong
-        strategy.entry("L", strategy.long, qty = bt_qty, comment = stratTag(bestStrat) + " " + str.tostring(bestScore, "#"))
-        strategy.exit("L-x", "L", stop = stopPrice, limit = tpPrice, comment_loss = "SL", comment_profit = "TP")
-    else
-        strategy.entry("S", strategy.short, qty = bt_qty, comment = stratTag(bestStrat) + " " + str.tostring(bestScore, "#"))
-        strategy.exit("S-x", "S", stop = stopPrice, limit = tpPrice, comment_loss = "SL", comment_profit = "TP")
+if fireSignal and bt_qty > 0
+    strategy.entry("L", strategy.long, qty = bt_qty, comment = stratTag(bestStrat) + " " + str.tostring(bestScore, "#"))
 
-// Time stop: close at the first confirmed bar at or beyond the profile horizon.
-if bt_useTimeStop and strategy.opentrades > 0
-    bt_age = time - strategy.opentrades.entry_time(strategy.opentrades - 1)
-    if bt_age >= p_timeStopDays * 86400000
+// Re-issued every bar so the working stop follows the engine. Two exits: the
+// partial leg (limit + stop on exit_partialPct of the position) and the
+// remainder (stop only). Once the partial has filled only the remainder is live.
+if strategy.position_size > 0
+    if not posPartialDone and not na(posPartial)
+        strategy.exit("L-part", "L", qty_percent = exit_partialPct, limit = posPartial, stop = posStop, comment_profit = "PARTIAL", comment_loss = "SL")
+    strategy.exit("L-rest", "L", stop = posStop, comment_loss = posStop == posStop0 ? "SL" : posStop == posEntry ? "BE" : "TRAIL")
+    // S1 time stop, and a resync guard if the engine and the strategy ever disagree.
+    if posSide == 1 and posStrat == 1 and time - posEntryTime >= p_timeStopDays * 86400000
         strategy.close_all(comment = "TIME")
+    if posSide == 0
+        strategy.close_all(comment = "RESYNC")

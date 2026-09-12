@@ -3,7 +3,7 @@
 Pine v6 multi-strategy conviction scanner for watchlist deployment, successor to
 `Adaptive Swing Scanner v1.0`.
 
-**Status: v2.0.0-phase1 — not yet compiled on TradingView.** Paste
+**Status: v3.0.0 — not yet compiled on TradingView.** Paste
 `asr_engine.pine` into the Pine editor and compile before deploying. Everything
 here is statically checked (delimiter balance, continuation-line indentation,
 tuple arity, dead identifiers) but nothing substitutes for the real compiler.
@@ -114,24 +114,25 @@ components, not to size on them.
 
 ---
 
-## Profiles
+## Profiles (v3)
 
 | | SWING | POSITIONAL |
 |---|---|---|
-| Entry timeframe | 4H | 1D |
-| Min conviction | 75 | 70 |
-| Min R:R | 1.5 | 1.5 |
+| Entry timeframe | 4H / 1D | 1D |
+| Strategies | S1 (trigger ∧ trend ≥ 18), S3 (gate 70), S4 (≥ 75) | S4 (≥ 75) only |
+| Selection | priority S1 > S4 > S3 | S4 |
 | ATR stop multiple | 1.5 | 2.75 |
-| Cooldown | 7200 min (5 days) | 21600 min (15 trading days) |
-| Time-stop horizon | 15 days | 60 days |
+| Exit S1 | chandelier 3×ATR from entry, 15-day time stop | — |
+| Exit S3/S4 | 50% at +1 R, breakeven, chandelier 3×ATR, no time stop | same |
+| Cooldown | 7200 min | 21600 min |
+| Positions | one per chart | one per chart |
 
-`INTRADAY_15M` / `INTRADAY_5M` (Phase 5) and `LONGTERM` (Phase 3) are **not**
-shipped. They require sub-strategies that do not exist yet — opening-range
-breakout and time-of-day-normalized relative volume for intraday, fundamental
-screening and a monthly trend overlay for long-term. Shipping them as parameter
-tweaks of the swing engine would be dishonest about what they are.
+Why these and not others: `PHASE3_FINDINGS.md`. S2 is gone (no edge). S1 is
+SWING-only (loses with wide stops). S3 is off in POSITIONAL (dilutes S4 under
+a slot cap). `useRegimeFilter` defaults OFF — the regime is still computed and
+emitted as metadata.
 
----
+`INTRADAY_15M` / `INTRADAY_5M` (Phase 5) and `LONGTERM` are **not** shipped.
 
 ## Deployment
 
@@ -145,6 +146,10 @@ tweaks of the swing engine would be dishonest about what they are.
    `alert()` supplies the payload.
 4. Webhook URL: `https://<host>/webhook?token=<TV_WEBHOOK_TOKEN>` — token in the
    query string, not the body.
+5. **Until the server is patched** (`SERVER_PATCH.md` item 9), set *Emit
+   SCALE / MODIFY / EXIT events* OFF. Lifecycle payloads carry `action=MANAGE`,
+   which the current model rejects — safely, but noisily. ENTRY payloads carry
+   the initial stop either way.
 
 **TradingView snapshots the script at alert-creation time.** Any edit to this
 file requires re-creating every alert on every symbol. Budget that as real
@@ -194,10 +199,11 @@ regressions nothing else will.
 
 ---
 
-## Phase 2 — validation (done)
+## Phase 2 — validation (done) · Phase 3 — exits and rules (done)
 
 `research/` holds the validation harness and its results. Read
-`PHASE2_FINDINGS.md` first; it is the kill/keep decision document. Summary:
+`PHASE2_FINDINGS.md` (kill/keep) then `PHASE3_FINDINGS.md` (exits, slot cap,
+deployed v3). Phase 2 summary:
 
 - The conviction score predicts outcome for **S4 only** (Spearman +0.063,
   holds out of sample). For S1/S2/S3 it is noise.
@@ -218,6 +224,11 @@ research/
   labels.py         triple-barrier labels with TradingView's broker-emulator fill rule
   build_events.py   one row per (symbol, bar, strategy, direction) trigger event → out/events_*.csv
   analysis.py       decile curves, walk-forward, regime matrix, ablation, DSR, PBO/CSCV → out/report_*.md
+  exit_study.py     14 exit models on every trigger event, train/test split → out/exit_study_*.md
+  simulate.py       sequential single-position simulation, v2 vs v3, per-strategy exits → out/phase3_simulation.md
+  portfolio_cap.py  slot-capped portfolio admission by priority → out/phase3_slot_cap.md
+  variants.py       rule variants under caps (decided POSITIONAL = S4 only) → out/phase3_variants.md
+  final_v3.py       deployed v3 (Pine defaults) vs v2, DSR → out/phase3_final.md
   parity_test.py    Strategy Tester export vs sequential replay — the gate on everything above
   build_twin.py     generates asr_engine_bt.pine from asr_engine.pine (text transform = parity by construction)
   data/             48 symbols × 3000 daily bars (TradingView, split-adjusted)
@@ -231,8 +242,8 @@ Regenerate the twin after any engine edit: `python research/build_twin.py` (`--c
 The parity gate has not yet been run — it needs a Strategy Tester export from
 a TradingView account (`research/parity_test.py` explains how).
 
-Phase 3 implements the Phase 2 decisions (exits first, S1 rewrite, S2 removal,
-regime to metadata), then adds the LONGTERM profile, Phase 5 the intraday profiles, and a separate
+Phase 4 adds a cross-profile portfolio allocator (SWING and POSITIONAL share
+the heat cap; the slot simulations were per profile), then the LONGTERM profile, Phase 5 the intraday profiles, and a separate
 `asr_rotation_403b.pine` handles the retirement sleeve — that one is
 cross-sectional over ~20 ETFs and emits portfolio weights rather than per-symbol
 entries, so it cannot share this engine's per-chart topology.

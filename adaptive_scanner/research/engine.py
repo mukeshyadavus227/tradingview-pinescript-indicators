@@ -70,9 +70,26 @@ class Params:
     shortEnabled: bool = False
     useRegimeFilter: bool = True
     mintick: float = 0.01
+    # ── v3 rules (Phase 3). version="v2" reproduces the Phase 1/2 engine exactly. ──
+    version: str = "v2"
+    s1_enabled: bool = True       # v3: S1 is SWING-only (loses with POSITIONAL's wide stops)
+    s1_trendGate: int = 18        # v3: S1 fires on trigger AND trend component >= this; no regime gate, no min score
+    s2_enabled: bool = True       # v3: False — no edge
+    s3_useThreshold: bool = True  # v3: gate S3 at s3_gate — not a predictor, a slot-cap rate limiter
+    s3_gate: float = 70.0
+    s4_minScore: float = 75.0     # v3: S4 keeps its validated threshold regardless of profile min score
+    priority: tuple = (1, 4, 3, 2)  # v3: winner = highest-priority eligible strategy (validated expectancy order), not max score
+
+
+V3_PARAMS = None  # set below
 
 
 DEFAULT_PARAMS = Params()
+V3_PARAMS = Params(version="v3", useRegimeFilter=False, s2_enabled=False, s3_useThreshold=False)
+# Deployed v3 (mirrors asr_engine.pine defaults): SWING = S1 + S4 + S3 gated at 70; POSITIONAL = S4 only.
+V3_SWING = Params(version="v3", useRegimeFilter=False, s2_enabled=False, s3_useThreshold=True, s3_gate=70.0, s1_enabled=True)
+V3_POSITIONAL = Params(version="v3", useRegimeFilter=False, s2_enabled=False, s1_enabled=False, priority=(4,))
+V3_DEPLOYED = {"SWING": V3_SWING, "POSITIONAL": V3_POSITIONAL}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -390,6 +407,22 @@ def run_engine(bars: pd.DataFrame, profile: Profile = SWING, p: Params = DEFAULT
     bestScore = np.where(isLong, bestLongScore, bestShortScore)
     bestStrat = np.where(isLong, bestLongStrat, bestShortStrat)
 
+    if p.version == "v3":
+        # Per-strategy ELIGIBILITY replaces score-argmax. Each strategy has its own
+        # validated gate; the winner is the highest-priority eligible one.
+        elig = {
+            1: s1_trigL & (s1_parts[:, 0] >= p.s1_trendGate) if p.s1_enabled else np.zeros(n, bool),
+            2: s2_trigL & (s2_scoreLong >= profile.min_score) if p.s2_enabled else np.zeros(n, bool),
+            3: s3_trigL & ((s3_scoreLong >= p.s3_gate) if p.s3_useThreshold else True),
+            4: s4_trigL & (s4_scoreLong >= p.s4_minScore),
+        }
+        bestStrat = np.zeros(n, int)
+        for k in reversed(p.priority):          # lowest priority first so higher overwrites
+            bestStrat = np.where(elig[k], k, bestStrat)
+        isLong = np.ones(n, bool)
+        scores_by = {1: s1_scoreLong, 2: s2_scoreLong, 3: s3_scoreLong, 4: s4_scoreLong}
+        bestScore = np.select([bestStrat == k for k in (1, 2, 3, 4)], [scores_by[k] for k in (1, 2, 3, 4)], 0.0)
+
     # ── risk levels [F7][F8] ──
     stopScale = profile.atr_stop_mult / 1.5
     tpScale = stopScale
@@ -420,7 +453,10 @@ def run_engine(bars: pd.DataFrame, profile: Profile = SWING, p: Params = DEFAULT
                 ~np.isnan(rvPctile) & ~np.isnan(dAtrPct) & (ta.nz(R["dCtxBars"]) >= ta.pine_round(252 * 0.8)))
     dAdv = R["dAdvUsd"]
     liquidityOk = ((p.minDollarVol <= 0) | (~np.isnan(dAdv) & (dAdv >= p.minDollarVol * 1e6))) & ((p.minPrice <= 0) | (c >= p.minPrice))
-    eligible = warmupOk & (bestStrat > 0) & (bestScore >= profile.min_score) & rrOk & liquidityOk
+    if p.version == "v3":
+        eligible = warmupOk & (bestStrat > 0) & rrOk & liquidityOk
+    else:
+        eligible = warmupOk & (bestStrat > 0) & (bestScore >= profile.min_score) & rrOk & liquidityOk
 
     # [F13] cooldown is sequential — the only state the engine carries.
     fired = np.zeros(n, bool)

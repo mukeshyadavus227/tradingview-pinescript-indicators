@@ -5,6 +5,40 @@ on every symbol — TradingView snapshots the script at alert-creation time.
 Bump `schema_version` in the payload alongside any such change so the server's
 version floor can reject alerts that were not re-created.
 
+## 3.0.0 — Phase 3: exit engine, validated rules
+
+**Alerts must be re-created.** Payload schema 2.1.0.
+
+### Changed
+- **Exit engine.** The indicator carries the position it last entered and
+  manages it bar by bar with the validation labeller's fill rules. S1: chandelier
+  3×ATR from entry, profile time stop. S3/S4: 50% at +1 R, breakeven, chandelier
+  3×ATR on the remainder, no time stop. Selected on 2015–20, confirmed 2021+.
+- **Payload.** One `alert()` per bar carrying `events[]` (ENTRY / SCALE /
+  MODIFY / EXIT / HEARTBEAT) and a live `desired_state`. Lifecycle events use
+  `action=MANAGE`; the unpatched server rejects them safely. `emitLifecycle`
+  and `emitHeartbeat` inputs.
+- **S1** fires on trigger ∧ own trend component ≥ 18; no regime gate, no score
+  threshold; SWING only.
+- **S3** gated at score ≥ 70 as a slot-cap rate limiter (not a predictor); off
+  in POSITIONAL by default.
+- **S4** unchanged at ≥ 75.
+- **Winner** = highest-priority eligible strategy (S1 > S4 > S3), long-only.
+- `useRegimeFilter` default OFF; regime still emitted.
+- One position per chart; `fireSignal` requires flat.
+- Twin execution block: partial-leg + remainder exits re-issued from the
+  engine's working stop; S1 time stop; resync guard.
+
+### Removed
+- S2 Donchian Breakout (no edge; CI spans zero).
+- Reference-line "last emitted" visualisation; replaced by live engine plots.
+- `Min Conviction Score` master input (per-strategy gates replace it).
+
+### Results (cap 10, test 2021+, see PHASE3_FINDINGS.md)
+- SWING: Sharpe 0.69 → 1.21, R/trade +0.09 → +0.22, max DD −22.5 → −19.1 R.
+- POSITIONAL (S4 only): Sharpe 1.10 → 1.27, max DD −21.5 → −10.9 R, capacity
+  +13.5 → +9.0 R/yr.
+
 ## 2.0.0-phase2 — validation harness and findings
 
 No change to emitted values except the R:R fix below. **Alerts must be re-created
