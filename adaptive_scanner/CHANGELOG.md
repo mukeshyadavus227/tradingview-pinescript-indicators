@@ -5,6 +5,23 @@ on every symbol — TradingView snapshots the script at alert-creation time.
 Bump `schema_version` in the payload alongside any such change so the server's
 version floor can reject alerts that were not re-created.
 
+## 3.1.1 — Phase 5: intraday profile evaluated and not shipped
+
+No change to emitted values. Pine header records the decision. No alert
+re-creation needed.
+
+### Added (research only)
+- `research/engine_intraday.py` — INTRADAY_15M mirror, adversarially reviewed.
+- `research/intraday_study.py`, `intraday_sim.py`, `intraday_baseline.py`,
+  intraday exit models and EOD-flat labelling in `labels.py`.
+- `research/data_15m/` — 48 symbols × 5,000 15m RTH bars (gzipped).
+
+### Findings (PHASE5_FINDINGS.md)
+- S5 ORB, S6 VWAP reclaim and S3i EMA cross: ~zero gross, negative after
+  5 bps, no stable alpha over a random-entry control in either half of the
+  window. Holding overnight helps and still loses. Not shipped.
+- INTRADAY_5M never built: 2 months of data, and outside Pine's reach.
+
 ## 3.1.0 — Phase 4: cross-profile allocation and server modules
 
 No change to the Pine or to emitted values. No alert re-creation needed.

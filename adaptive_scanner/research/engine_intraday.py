@@ -69,7 +69,7 @@ def session_index(t_unix):
 def daily_context_for(daily: pd.DataFrame, dates: np.ndarray):
     """Prior completed daily bar's features, mapped to each intraday bar's session date."""
     d = daily.copy()
-    d["date"] = pd.to_datetime(d.t, unit="s", utc=True).tz_convert(ET).strftime("%Y-%m-%d").values
+    d["date"] = pd.to_datetime(d.t.values, unit="s", utc=True).tz_convert(ET).strftime("%Y-%m-%d").values
     o, h, l, c, v = (d[k].values.astype(float) for k in "ohlcv")
     feats = pd.DataFrame({
         "date": d.date.values,

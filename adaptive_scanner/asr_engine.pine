@@ -28,6 +28,12 @@ indicator("Adaptive Scanner Engine", "ASR", overlay = true,
 //       reconciles against broker state rather than replaying deltas.
 //
 //   Profiles shipped:  SWING, POSITIONAL
+//   INTRADAY_15M / _5M: evaluated in Phase 5 and NOT shipped. Over 193 RTH
+//       sessions x 48 names, ORB, VWAP-reclaim and 15m EMA-cross constructions
+//       showed no after-cost edge and none over a random-entry control (which
+//       itself loses ~0.1-0.2 R at 5 bps: flat-by-close forgoes the overnight
+//       premium). See PHASE5_FINDINGS.md. Building the profile would have been
+//       infrastructure ahead of evidence.
 //   Profiles deferred: INTRADAY_15M / INTRADAY_5M (Phase 5, needs S5 ORB +
 //                      S6 VWAP-reclaim + time-of-day RVOL), LONGTERM (Phase 3,
 //                      needs S9 fundamentals + S10 monthly overlay)

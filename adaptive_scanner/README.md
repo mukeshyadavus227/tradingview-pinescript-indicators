@@ -132,7 +132,9 @@ SWING-only (loses with wide stops). S3 is off in POSITIONAL (dilutes S4 under
 a slot cap). `useRegimeFilter` defaults OFF — the regime is still computed and
 emitted as metadata.
 
-`INTRADAY_15M` / `INTRADAY_5M` (Phase 5) and `LONGTERM` are **not** shipped.
+`INTRADAY_15M` / `INTRADAY_5M` were evaluated in Phase 5 and are **not**
+shipped — no after-cost edge and none over a random-entry control
+(`PHASE5_FINDINGS.md`). `LONGTERM` is not built.
 
 ## Deployment
 
@@ -199,12 +201,13 @@ regressions nothing else will.
 
 ---
 
-## Phase 2 — validation · Phase 3 — exits and rules · Phase 4 — allocation (all done)
+## Phase 2 — validation · Phase 3 — exits and rules · Phase 4 — allocation · Phase 5 — intraday (evaluated, not shipped)
 
 `research/` holds the validation harness and its results; `server/` holds the
 drop-in modules for the webhook server. Read `PHASE2_FINDINGS.md` (kill/keep),
 `PHASE3_FINDINGS.md` (exits, slot cap, deployed v3), `PHASE4_FINDINGS.md`
-(cross-profile allocation in % NAV). Phase 2 summary:
+(cross-profile allocation in % NAV), `PHASE5_FINDINGS.md` (intraday: no edge
+after costs, no edge over a random-entry control — not shipped). Phase 2 summary:
 
 - The conviction score predicts outcome for **S4 only** (Spearman +0.063,
   holds out of sample). For S1/S2/S3 it is noise.
@@ -231,6 +234,9 @@ research/
   variants.py       rule variants under caps (decided POSITIONAL = S4 only) → out/phase3_variants.md
   final_v3.py       deployed v3 (Pine defaults) vs v2, DSR → out/phase3_final.md
   portfolio_sim.py  cross-profile portfolio in % NAV; imports server.allocator → out/phase4_portfolio.md
+  engine_intraday.py  INTRADAY_15M mirror (ORB, VWAP reclaim, 15m EMA cross, ToD RVOL, session VWAP)
+  intraday_study.py / intraday_sim.py / intraday_baseline.py  Phase 5 validation + random-entry control → out/phase5_intraday.md
+  data_15m/         48 symbols × 5000 15m RTH bars, gzipped
 server/
   schema.py         pydantic models for payload 2.1.0 (superset of v1 TVSignal)
   allocator.py      slot / heat / symbol-uniqueness admission — the same code the simulation validated
@@ -249,8 +255,9 @@ Regenerate the twin after any engine edit: `python research/build_twin.py` (`--c
 The parity gate has not yet been run — it needs a Strategy Tester export from
 a TradingView account (`research/parity_test.py` explains how).
 
-Phase 5 adds the intraday profiles (needs S5 ORB, S6 VWAP-reclaim,
-time-of-day RVOL), and the LONGTERM profile, Phase 5 the intraday profiles, and a separate
+Phase 6 candidate: intraday triggers as entry timing for the SWING profile,
+held under the v3 exit engine (the one intraday construction Phase 5 left
+open). Beyond that, the LONGTERM profile, Phase 5 the intraday profiles, and a separate
 `asr_rotation_403b.pine` handles the retirement sleeve — that one is
 cross-sectional over ~20 ETFs and emits portfolio weights rather than per-symbol
 entries, so it cannot share this engine's per-chart topology.
