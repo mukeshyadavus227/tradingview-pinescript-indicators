@@ -199,11 +199,12 @@ regressions nothing else will.
 
 ---
 
-## Phase 2 — validation (done) · Phase 3 — exits and rules (done)
+## Phase 2 — validation · Phase 3 — exits and rules · Phase 4 — allocation (all done)
 
-`research/` holds the validation harness and its results. Read
-`PHASE2_FINDINGS.md` (kill/keep) then `PHASE3_FINDINGS.md` (exits, slot cap,
-deployed v3). Phase 2 summary:
+`research/` holds the validation harness and its results; `server/` holds the
+drop-in modules for the webhook server. Read `PHASE2_FINDINGS.md` (kill/keep),
+`PHASE3_FINDINGS.md` (exits, slot cap, deployed v3), `PHASE4_FINDINGS.md`
+(cross-profile allocation in % NAV). Phase 2 summary:
 
 - The conviction score predicts outcome for **S4 only** (Spearman +0.063,
   holds out of sample). For S1/S2/S3 it is noise.
@@ -229,12 +230,18 @@ research/
   portfolio_cap.py  slot-capped portfolio admission by priority → out/phase3_slot_cap.md
   variants.py       rule variants under caps (decided POSITIONAL = S4 only) → out/phase3_variants.md
   final_v3.py       deployed v3 (Pine defaults) vs v2, DSR → out/phase3_final.md
+  portfolio_sim.py  cross-profile portfolio in % NAV; imports server.allocator → out/phase4_portfolio.md
+server/
+  schema.py         pydantic models for payload 2.1.0 (superset of v1 TVSignal)
+  allocator.py      slot / heat / symbol-uniqueness admission — the same code the simulation validated
+  reconciler.py     desired_state vs broker state → minimal order diff, idempotent
+  tests/            python -m pytest server/tests
   parity_test.py    Strategy Tester export vs sequential replay — the gate on everything above
   build_twin.py     generates asr_engine_bt.pine from asr_engine.pine (text transform = parity by construction)
   data/             48 symbols × 3000 daily bars (TradingView, split-adjusted)
 ```
 
-Reproduce: `pip install -r research/requirements.txt && cd research && python build_events.py && python analysis.py`.
+Reproduce: `pip install -r research/requirements.txt && cd research && python build_events.py && python analysis.py && python final_v3.py && python portfolio_sim.py`.
 Regenerate the twin after any engine edit: `python research/build_twin.py` (`--check` to verify it is current).
 
 ## What is not built yet
@@ -242,8 +249,8 @@ Regenerate the twin after any engine edit: `python research/build_twin.py` (`--c
 The parity gate has not yet been run — it needs a Strategy Tester export from
 a TradingView account (`research/parity_test.py` explains how).
 
-Phase 4 adds a cross-profile portfolio allocator (SWING and POSITIONAL share
-the heat cap; the slot simulations were per profile), then the LONGTERM profile, Phase 5 the intraday profiles, and a separate
+Phase 5 adds the intraday profiles (needs S5 ORB, S6 VWAP-reclaim,
+time-of-day RVOL), and the LONGTERM profile, Phase 5 the intraday profiles, and a separate
 `asr_rotation_403b.pine` handles the retirement sleeve — that one is
 cross-sectional over ~20 ETFs and emits portfolio weights rather than per-symbol
 entries, so it cannot share this engine's per-chart topology.

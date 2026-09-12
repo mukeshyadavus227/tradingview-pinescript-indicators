@@ -111,6 +111,12 @@ file in this repository.
 
 ## 9. Lifecycle events and desired-state reconciliation (Phase 3)
 
+**Reference implementation: `server/schema.py` and `server/reconciler.py`**
+(`python -m pytest server/tests`). Replace `TVSignal` with `SignalV2` — it is
+a superset with the same v1 field names and defaults — and call
+`reconcile(signal, broker_position, broker_orders, entry_qty, full_qty)` on
+every lifecycle payload; it returns the minimal order diff and is idempotent.
+
 Schema 2.1.0 payloads carry `event`, `events[]` and a live `desired_state`.
 `action` is `BUY` on ENTRY and **`MANAGE`** on every other event.
 
@@ -144,6 +150,19 @@ rank S3 candidates on score — it does not predict their outcome.
 **Until this item lands**, tell the operator to set the indicator's *Emit
 SCALE / MODIFY / EXIT events* input OFF; ENTRY payloads still carry the
 initial stop and the partial level in `comment`.
+
+## 10. Slot allocation across profiles (Phase 4)
+
+**Reference implementation: `server/allocator.py`.** Before sizing an ENTRY,
+call `Allocator(AllocatorConfig(max_positions=10, risk_pct=1.0,
+max_heat_pct=10.0, one_per_symbol=True, rule="per_bar")).admit_batch(...)`
+with every ENTRY received on the same bar and the current open positions.
+Rejections carry a reason (`symbol already held`, `slots full`, `heat cap`).
+
+Validated choices (PHASE4_FINDINGS.md): one position per symbol across
+profiles is non-negotiable; ten slots at 1% risk; keep the existing "max 3 per
+sector" rule in front of the allocator. Do not run POSITIONAL against the
+same heat budget as SWING — give it its own sleeve or leave it off.
 
 ---
 

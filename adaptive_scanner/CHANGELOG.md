@@ -5,6 +5,29 @@ on every symbol — TradingView snapshots the script at alert-creation time.
 Bump `schema_version` in the payload alongside any such change so the server's
 version floor can reject alerts that were not re-created.
 
+## 3.1.0 — Phase 4: cross-profile allocation and server modules
+
+No change to the Pine or to emitted values. No alert re-creation needed.
+
+### Added
+- `server/schema.py`, `server/allocator.py`, `server/reconciler.py` with
+  tests (21 passing). The allocator is imported by
+  `research/portfolio_sim.py`, so the admission rule validated in research and
+  the rule the server runs are the same code; a replay test asserts it.
+- `research/portfolio_sim.py` — SWING v3 + POSITIONAL v3 candidates through a
+  shared slot budget, sized as a fraction of current equity, reported in % NAV.
+
+### Findings (PHASE4_FINDINGS.md)
+- One open position per symbol across profiles is the rule that matters
+  (Sharpe 0.81 → 1.32 at cap 10). Arrival order ≈ per-bar tiebreak; priority
+  by per-trade expectancy is wrong under a shared cap; reserving slots per
+  profile minimises drawdown and costs a third of the return.
+- POSITIONAL adds nothing to a shared cap-10 book; on its own capital it is a
+  half-return / half-vol / same-Sharpe product. Separate sleeve or don't run.
+- Ten slots at 1% risk (10% heat) is the configuration. Five slots collapse
+  under the heat cap; 1.5% risk buys a third more return for a −40% all-period
+  drawdown bound.
+
 ## 3.0.0 — Phase 3: exit engine, validated rules
 
 **Alerts must be re-created.** Payload schema 2.1.0.
