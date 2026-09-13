@@ -8,3 +8,17 @@ _dev/
 .idea
 .vscode
 .DS_Store
+
+# adaptive_scanner research: event tables are regenerable (python research/build_events.py) and ~20MB each
+adaptive_scanner/research/out/events_*.csv
+adaptive_scanner/research/__pycache__/
+adaptive_scanner/research/out/sim_*.csv
+adaptive_scanner/research/out/final_*.csv
+adaptive_scanner/research/out/exit_events_*.csv
+__pycache__/
+.pytest_cache/
+# raw 15m CSVs are regenerable; the gzipped set is committed
+adaptive_scanner/research/data_15m/*.csv
+adaptive_scanner/research/out/events_INTRADAY.csv
+adaptive_scanner/research/out/intraday_trades_*.csv
+adaptive_scanner/research/out/phase6_*.csv
