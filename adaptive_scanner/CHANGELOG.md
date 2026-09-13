@@ -5,6 +5,30 @@ on every symbol — TradingView snapshots the script at alert-creation time.
 Bump `schema_version` in the payload alongside any such change so the server's
 version floor can reject alerts that were not re-created.
 
+## 3.1.2 — Phase 6: entry timing decided; no intraday trigger
+
+No change to emitted values. No alert re-creation needed. The fill rule is a
+server-side decision (`SERVER_PATCH.md` item 11).
+
+### Added (research only)
+- `research/phase6_entry_timing.py` — daily SWING signals re-filled under eight
+  intraday entry rules (next open, next close, opening-range break, VWAP
+  confirmation, pullback limits, limit-then-MOC) with the fill session
+  collapsed into a partial daily bar and the v3 exit engine run from there.
+- `research/phase6_fill_baseline.py` and `simulate.simulate_symbol(fill=)` —
+  the deployed profiles over twelve years with a next-open fill.
+
+### Findings (PHASE6_FINDINGS.md)
+- Opening-range and VWAP confirmation lose 0.16–0.17 R per trade to a plain
+  next-open fill on identical signals (95% CI excludes zero). Pullback limits
+  improve the trades they fill and miss the winners; per signal no better
+  than the open. Nothing ships.
+- The Phase 2–4 close-fill convention overstated the deployable edge by
+  −0.02 R per trade (SWING) and −0.01 R (POSITIONAL) over twelve years; by
+  −0.14 R in the 2025-12 → 2026-09 window. Fill rule fixed as market-on-open
+  next session against the absolute stop. README numbers are now the
+  next-open numbers.
+
 ## 3.1.1 — Phase 5: intraday profile evaluated and not shipped
 
 No change to emitted values. Pine header records the decision. No alert

@@ -90,7 +90,10 @@ Current config is global: signal staleness 5 minutes, `max_orders_per_day` 20.
 
 - **Staleness.** Five minutes is right for intraday and wrong for a daily close:
   a 1D signal fires at 16:00 ET and is dead before anything can act on it.
-  Suggested: `INTRADAY 5min / SWING 90min / POSITIONAL 8h / LONGTERM 48h`.
+  With the Phase 6 fill rule (item 11) a SWING / POSITIONAL signal is valid
+  until 30 minutes after the next session's open, not for a fixed number of
+  minutes. Suggested: `INTRADAY 5min / SWING, POSITIONAL next open + 30min /
+  LONGTERM 48h`.
 - **Order cap.** Twenty per day across the whole watchlist is fine for swing and
   will saturate in the first hour of an intraday profile across 20 names. Make
   it per-profile, and add a per-symbol-per-day cap.
@@ -163,6 +166,29 @@ Validated choices (PHASE4_FINDINGS.md): one position per symbol across
 profiles is non-negotiable; ten slots at 1% risk; keep the existing "max 3 per
 sector" rule in front of the allocator. Do not run POSITIONAL against the
 same heat budget as SWING — give it its own sleeve or leave it off.
+
+## 11. Entry fill rule (Phase 6)
+
+The engine signals at the daily close. Fill **market-on-open the next
+session** and place the bracket at the engine's absolute `stop` (do not
+re-anchor the stop distance to the fill). Over twelve years this costs
+−0.02 R per trade against the harness's close-fill assumption; the numbers
+in the README are already the next-open numbers.
+
+Do not add a limit-at-signal-close, a limit-with-MOC-fallback, or an
+opening-range / VWAP confirmation before the fill. Each was tested on
+identical signals (`PHASE6_FINDINGS.md`); none beats the open per signal and
+the two intraday confirmations lose by 0.16–0.17 R per trade.
+
+Log `fill_px`, `signal_px` (`desired_state.entry_ref`) and `atr_d` on every
+entry so `(fill − signal) / atr_d` can be monitored: the 2025-12 → 2026-09
+window ran a median +0.08 ATR overnight slip and a −0.14 R per-trade haircut,
+seven times the twelve-year average. Two consecutive quarters above +0.10 ATR
+median is the trigger to revisit §5 of the Phase 6 findings.
+
+If a fill lands at or below the engine's stop (a gap through the stop
+overnight), do not enter — the signal is void for that session, and the
+Pine will re-signal if the setup is still valid at the next close.
 
 ---
 

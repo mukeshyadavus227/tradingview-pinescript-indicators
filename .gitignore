@@ -21,3 +21,4 @@ __pycache__/
 adaptive_scanner/research/data_15m/*.csv
 adaptive_scanner/research/out/events_INTRADAY.csv
 adaptive_scanner/research/out/intraday_trades_*.csv
+adaptive_scanner/research/out/phase6_*.csv

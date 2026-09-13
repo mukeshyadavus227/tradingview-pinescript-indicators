@@ -34,9 +34,12 @@ indicator("Adaptive Scanner Engine", "ASR", overlay = true,
 //       itself loses ~0.1-0.2 R at 5 bps: flat-by-close forgoes the overnight
 //       premium). See PHASE5_FINDINGS.md. Building the profile would have been
 //       infrastructure ahead of evidence.
-//   Profiles deferred: INTRADAY_15M / INTRADAY_5M (Phase 5, needs S5 ORB +
-//                      S6 VWAP-reclaim + time-of-day RVOL), LONGTERM (Phase 3,
-//                      needs S9 fundamentals + S10 monthly overlay)
+//   Entry timing (Phase 6): the signal fires at the daily close; the server
+//       fills MARKET-ON-OPEN next session against the absolute stop emitted
+//       here. Opening-range and VWAP confirmations on 15m bars lose 0.16-0.17 R
+//       per trade to that plain fill on identical signals; pullback limits miss
+//       the winners. Nothing intraday gates the entry. See PHASE6_FINDINGS.md.
+//   Profiles deferred: LONGTERM (needs S9 fundamentals + S10 monthly overlay)
 //   Deliberately NOT shipped: score-driven position sizing. See CONFIDENCE.
 //
 // WHAT CHANGED FROM v1.0 (every item is a defect fix, not a feature)

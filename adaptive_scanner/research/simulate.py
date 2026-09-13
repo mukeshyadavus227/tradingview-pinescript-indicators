@@ -21,7 +21,10 @@ EXITS_V3 = {1: M["M5_chand3_only"], 2: M["M0_current"], 3: M["M8_partial_chand3_
 SPLIT = pd.Timestamp("2021-01-01")
 
 
-def simulate_symbol(sym, bars, profile, params, exits):
+def simulate_symbol(sym, bars, profile, params, exits, fill="close"):
+    """fill="close": entry at the signal close (harness convention, not executable live).
+    fill="next_open": entry at the next session's open against the engine's absolute stop — the
+    fill a daily-close webhook can actually get (Phase 6)."""
     d = run_engine(bars, profile, params)
     o, h, l, c = (bars[k].values.astype(float) for k in "ohlc")
     atr, tm = d.atr.values, bars.t.values.astype(np.int64) * 1000
@@ -31,8 +34,14 @@ def simulate_symbol(sym, bars, profile, params, exits):
         if t <= busy_until or (last and tm[t] - last < cd_ms):
             continue
         k = int(d.bestStrat.values[t])
-        lab = label_event_v3(o, h, l, c, atr, tm, int(t), True, float(d.entryRef.values[t]),
-                             float(d.stopPrice.values[t]), float(d.tpPrice.values[t]), profile.time_stop_days, exits[k])
+        entry, stop, tp = float(d.entryRef.values[t]), float(d.stopPrice.values[t]), float(d.tpPrice.values[t])
+        if fill == "next_open":
+            if t + 1 >= len(c):
+                continue
+            entry = round(float(o[t + 1]), 2)
+            if entry <= stop:
+                continue
+        lab = label_event_v3(o, h, l, c, atr, tm, int(t), True, entry, stop, tp, profile.time_stop_days, exits[k])
         if lab is None:
             continue
         busy_until = t + lab["bars_held"]; last = tm[t]
