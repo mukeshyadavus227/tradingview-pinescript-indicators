@@ -1164,15 +1164,26 @@ bt_qty = realRisk > 0 ? math.max(1, math.floor(strategy.equity * bt_riskPct / 10
 if fireSignal and bt_qty > 0
     strategy.entry("L", strategy.long, qty = bt_qty, comment = stratTag(bestStrat) + " " + str.tostring(bestScore, "#"))
 
-// Re-issued every bar so the working stop follows the engine. Two exits: the
-// partial leg (limit + stop on exit_partialPct of the position) and the
-// remainder (stop only). Once the partial has filled only the remainder is live.
-if strategy.position_size > 0
+// The bracket is issued on the ENTRY bar as well as on every bar in the
+// position. With process_orders_on_close the entry fills at this bar's close,
+// AFTER the script has run, so strategy.position_size is still 0 here; an exit
+// issued only once position_size > 0 would not exist during the next bar's
+// intrabar path, while the engine (and the labeller) treat the bracket as live
+// from bar t+1. Exit orders bound to a pending entry wait for its fill, so
+// issuing them now makes them live from the next bar — the bar the engine
+// starts checking. Two exits: the partial leg (limit + stop on exit_partialPct
+// of the position) and the remainder (stop only); once the partial has filled
+// only the remainder is live. Re-issued every bar so the stop follows the engine.
+if posSide == 1 and (fireSignal or strategy.position_size > 0)
     if not posPartialDone and not na(posPartial)
         strategy.exit("L-part", "L", qty_percent = exit_partialPct, limit = posPartial, stop = posStop, comment_profit = "PARTIAL", comment_loss = "SL")
     strategy.exit("L-rest", "L", stop = posStop, comment_loss = posStop == posStop0 ? "SL" : posStop == posEntry ? "BE" : "TRAIL")
-    // S1 time stop, and a resync guard if the engine and the strategy ever disagree.
-    if posSide == 1 and posStrat == 1 and time - posEntryTime >= p_timeStopDays * 86400000
-        strategy.close_all(comment = "TIME")
-    if posSide == 0
-        strategy.close_all(comment = "RESYNC")
+
+// The engine has already set posSide to 0 on the bar it exits, so the reason
+// must come from the engine's own event, not from posSide/posStrat. TIME is a
+// market close at this bar's close (process_orders_on_close), which is what the
+// labeller books. Anything else still open here is a genuine disagreement
+// between the broker emulator and the engine: flatten it and tag it RESYNC so
+// the parity test can attribute it instead of hiding it.
+if strategy.position_size > 0 and posSide == 0
+    strategy.close_all(comment = evExit and evExitWhy == "TIME" ? "TIME" : "RESYNC")

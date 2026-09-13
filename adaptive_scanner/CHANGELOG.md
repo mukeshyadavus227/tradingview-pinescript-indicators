@@ -5,6 +5,63 @@ on every symbol — TradingView snapshots the script at alert-creation time.
 Bump `schema_version` in the payload alongside any such change so the server's
 version floor can reject alerts that were not re-created.
 
+## 3.1.3 — Parity gate made runnable; twin execution block fixed
+
+No change to emitted values. No alert re-creation needed. `asr_engine.pine`
+is untouched; the generated twin's execution block and the research harness
+changed. **The gate itself is still unrun**: neither the session that built
+the engine nor this one (2026-09-13) could reach tradingview.com, so nothing
+was compiled and no Strategy Tester export exists.
+
+### Fixed
+- `research/build_twin.py` (twin regenerated, `--check` clean). The bracket
+  was issued only once `strategy.position_size > 0`, which under
+  `process_orders_on_close` is the bar after the entry: no stop or partial
+  existed during the first bar's intrabar path while the engine and the
+  labeller treat it as live from bar t+1. Exits are now issued on the entry
+  bar too. Time-stop exits printed `RESYNC` because the engine has already
+  set `posSide` to 0 on its exit bar; TIME now comes from `evExitWhy`, and
+  RESYNC is reserved for a genuine emulator/engine disagreement.
+- `research/parity_test.py`. The replay used the Phase 2 labeller
+  (`label_event`: TP / SL / TIME) against a twin executing the v3 exits, so
+  the gate could not have passed for any S3/S4 trade; it now replays
+  `simulate.simulate_symbol` with `engine.V3_DEPLOYED` and `EXITS_V3` at the
+  close fill, the call behind `phase3_final.md` / `phase6_fill_baseline.md`.
+  The parser raised on TradingView's current `Price USD` header, counted
+  each partial exit as a separate trade, and knew no BE / TRAIL / RESYNC
+  reasons; it now accepts both header generations, collapses partial legs
+  to one trade per entry, and classes every reason the twin prints.
+  Docstring corrected: the twin has no *only when flat* / *time stop*
+  inputs (flat-only is structural).
+
+### Added
+- `parity_test.py`: comparison window (default first bar + 4 years, so the
+  weekly EMA seeding has converged; TradingView's longer history is dropped
+  before it), mismatch attribution (`POC_CLOSE_ATTEMPT`, `RESYNC`,
+  `TIME_1BAR`, `SEQUENCE`, `WINDOW_EDGE`, …), per-run JSON in `out/` with
+  `--summary` pooling, tolerance 1.5 ticks (slippage + display rounding of
+  off-grid fills), and `--selftest` on synthetic exports in TradingView's
+  shape — passes 61/61 SWING and 22/22 POSITIONAL on SPY, both formats.
+- `research/data_parity/SPY.csv`: 5,000 daily bars, same feed as `data/`
+  (0 differing rows on the 3,000-bar overlap). The research-window trade
+  list is identical on either file.
+- `labels.label_event_v3`: optional `mintick` (chandelier rounded to the tick
+  grid, as `math.round_to_mintick` in the Pine), `exit_price`, partial and
+  `poc_bar` diagnostics; `simulate.simulate_symbol(mintick=)` pass-through and
+  parity fields (`entry`, `exit_px`, `partial_date`, `poc_date`). Defaults
+  unchanged: identical output on a five-symbol regression. Tick rounding
+  changes no exit date and moves no exit price by more than half a tick in
+  that sample; the research scripts were not re-run for it.
+
+### Findings
+- Predicted residual class, not fixable in the twin: when the engine raises
+  the stop at a bar's close to at or above that close, the Strategy Tester
+  fills the re-issued stop at that close (`process_orders_on_close`) while
+  the engine exits next bar. The replay flags exposed trades; SPY has none in
+  either profile, and none of 286 deployed-profile trades across five symbols.
+- On one symbol, ≥ 99% means zero mismatches (SPY: n = 61 SWING, 22
+  POSITIONAL in the parity window). Pool symbols with `--summary`.
+
 ## 3.1.2 — Phase 6: entry timing decided; no intraday trigger
 
 No change to emitted values. No alert re-creation needed. The fill rule is a
