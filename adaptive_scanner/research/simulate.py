@@ -21,10 +21,11 @@ EXITS_V3 = {1: M["M5_chand3_only"], 2: M["M0_current"], 3: M["M8_partial_chand3_
 SPLIT = pd.Timestamp("2021-01-01")
 
 
-def simulate_symbol(sym, bars, profile, params, exits, fill="close"):
+def simulate_symbol(sym, bars, profile, params, exits, fill="close", mintick=None):
     """fill="close": entry at the signal close (harness convention, not executable live).
     fill="next_open": entry at the next session's open against the engine's absolute stop — the
-    fill a daily-close webhook can actually get (Phase 6)."""
+    fill a daily-close webhook can actually get (Phase 6).
+    mintick: forwarded to the labeller (tick-rounded chandelier, as the Pine); parity_test passes it."""
     d = run_engine(bars, profile, params)
     o, h, l, c = (bars[k].values.astype(float) for k in "ohlc")
     atr, tm = d.atr.values, bars.t.values.astype(np.int64) * 1000
@@ -41,7 +42,7 @@ def simulate_symbol(sym, bars, profile, params, exits, fill="close"):
             entry = round(float(o[t + 1]), 2)
             if entry <= stop:
                 continue
-        lab = label_event_v3(o, h, l, c, atr, tm, int(t), True, entry, stop, tp, profile.time_stop_days, exits[k])
+        lab = label_event_v3(o, h, l, c, atr, tm, int(t), True, entry, stop, tp, profile.time_stop_days, exits[k], mintick=mintick)
         if lab is None:
             continue
         busy_until = t + lab["bars_held"]; last = tm[t]
@@ -51,7 +52,13 @@ def simulate_symbol(sym, bars, profile, params, exits, fill="close"):
                            reason=lab["reason"], bars=lab["bars_held"], mfe=lab["mfe_R"], mae=lab["mae_R"],
                            dMom121=float(d.dMom121.values[t]), distFromHi=float(d.distFromHi.values[t]),
                            rvPctile=float(d.rvPctile.values[t]), dAtrPct=float(d.dAtrPct.values[t]),
-                           dRoc20=float(d.dRoc20.values[t]), dRoc60=float(d.dRoc60.values[t])))
+                           dRoc20=float(d.dRoc20.values[t]), dRoc60=float(d.dRoc60.values[t]),
+                           # parity fields (parity_test.py): prices and bars the Strategy Tester export is compared against
+                           entry=entry, stop0=stop, exit_px=lab["exit_price"],
+                           partial_date=(pd.Timestamp(d.date.values[lab["partial_idx"]]) if lab["partial_idx"] is not None else pd.NaT),
+                           partial_px=lab["partial_px"],
+                           poc_date=(pd.Timestamp(d.date.values[lab["poc_bar"]]) if lab["poc_bar"] is not None else pd.NaT),
+                           poc_px=lab["poc_px"]))
     return trades
 
 

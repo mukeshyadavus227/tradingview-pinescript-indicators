@@ -19,6 +19,7 @@ MFE/MAE in R, and R net of costs at several round-trip cost levels in bps of
 entry price — that is the cost-sensitivity curve.
 """
 import numpy as np
+from pine_ta import round_to_mintick
 
 REASONS = ("TP", "SL", "TP_GAP", "SL_GAP", "TIME", "EOD")
 COST_BPS = (0, 1, 3, 5, 10)
@@ -136,9 +137,19 @@ MODELS = [
 ]
 
 
-def label_event_v3(o, h, l, c, atr, time_ms, t, is_long, entry, stop0, tp, horizon_days, m: ExitModel, cost_bps=3.0, flat_at_idx=None):
+def label_event_v3(o, h, l, c, atr, time_ms, t, is_long, entry, stop0, tp, horizon_days, m: ExitModel, cost_bps=3.0, flat_at_idx=None,
+                   mintick=None):
     """Returns R (position-weighted, net of cost_bps per leg round trip), plus diagnostics.
-    Long logic written once; shorts mirror via `sgn`."""
+    Long logic written once; shorts mirror via `sgn`.
+
+    mintick: when given, the chandelier level is rounded to the tick grid exactly as the Pine does
+    (math.round_to_mintick(posExtreme - k * atr)); the parity replay passes it, the research scripts
+    keep the default (unrounded, sub-tick effect only).
+    Also returned: exit_idx / exit_price of the final leg, partial_idx / partial_px, and poc_bar / poc_px —
+    the first bar on which the close-of-bar stop update produced a stop at or beyond that bar's close
+    while the position was still open. On such a bar the Strategy Tester twin (process_orders_on_close)
+    fills the re-issued stop at the close, whereas the engine and this labeller exit on the next bar;
+    the parity test uses it to attribute that mismatch class."""
     n = len(c)
     risk = abs(entry - stop0)
     if risk <= 0 or t >= n - 1:
@@ -152,7 +163,8 @@ def label_event_v3(o, h, l, c, atr, time_ms, t, is_long, entry, stop0, tp, horiz
     partial_px = entry + sgn * m.partial_r * risk
     trail_on = m.trail_k > 0 and m.trail_from == "entry"
     extreme = entry                     # highest high (long) / lowest low (short) since entry
-    legs = []                           # (fraction, exit_price, reason)
+    legs = []                           # (fraction, exit_price, reason, bar_idx)
+    poc_bar = None
     mfe = mae = 0.0
     cost_r = (entry * cost_bps / 1e4) / risk
 
@@ -178,13 +190,13 @@ def label_event_v3(o, h, l, c, atr, time_ms, t, is_long, entry, stop0, tp, horiz
 
         def close_all(px, why):
             nonlocal size_open, exit_i
-            legs.append((size_open, px, why)); size_open = 0.0; exit_i = i
+            legs.append((size_open, px, why, i)); size_open = 0.0; exit_i = i
 
         def fill_target():
             nonlocal size_open, partial_done, pending_be, trail_on, exit_i
             px = oi if tgt_gap else tgt_px
             if not partial_done:
-                legs.append((m.partial_frac, px, "PARTIAL")); size_open -= m.partial_frac; partial_done = True
+                legs.append((m.partial_frac, px, "PARTIAL", i)); size_open -= m.partial_frac; partial_done = True
                 if m.trail_k > 0 and m.trail_from == "partial":
                     trail_on = True
                 if m.breakeven_after_partial:
@@ -219,17 +231,26 @@ def label_event_v3(o, h, l, c, atr, time_ms, t, is_long, entry, stop0, tp, horiz
             close_all(ci, "TIME"); break
 
         # --- close-of-bar stop management, effective next bar ---
+        stop_prev = stop
         if pending_be:
             stop = max(stop, entry) if is_long else min(stop, entry)
             pending_be = False
         extreme = max(extreme, hi) if is_long else min(extreme, li)
         if trail_on and not np.isnan(atr[i]):
             cand = extreme - m.trail_k * atr[i] if is_long else extreme + m.trail_k * atr[i]
+            if mintick:
+                cand = float(round_to_mintick(cand, mintick))
             stop = max(stop, cand) if is_long else min(stop, cand)
+        if poc_bar is None and stop != stop_prev and ((ci <= stop) if is_long else (ci >= stop)):
+            poc_bar = i
 
     if size_open > 0:
-        legs.append((size_open, c[n - 1], "EOD")); exit_i = n - 1
-    r = sum(f * sgn * (px - entry) / risk for f, px, _ in legs) - cost_r * (1 + (len(legs) - 1) * 0.5)
+        legs.append((size_open, c[n - 1], "EOD", n - 1)); exit_i = n - 1
+    r = sum(f * sgn * (px - entry) / risk for f, px, _, _ in legs) - cost_r * (1 + (len(legs) - 1) * 0.5)
     final = legs[-1][2]
-    return dict(R=r, reason=final, partial=any(w == "PARTIAL" for _, _, w in legs),
-                bars_held=exit_i - t, mfe_R=mfe, mae_R=mae, n_legs=len(legs))
+    part = next((L for L in legs if L[2] == "PARTIAL"), None)
+    return dict(R=r, reason=final, partial=part is not None,
+                bars_held=exit_i - t, mfe_R=mfe, mae_R=mae, n_legs=len(legs),
+                exit_idx=exit_i, exit_price=float(legs[-1][1]),
+                partial_idx=(part[3] if part else None), partial_px=(float(part[1]) if part else np.nan),
+                poc_bar=poc_bar, poc_px=(float(c[poc_bar]) if poc_bar is not None else np.nan))

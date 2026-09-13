@@ -3,10 +3,13 @@
 Pine v6 multi-strategy conviction scanner for watchlist deployment, successor to
 `Adaptive Swing Scanner v1.0`.
 
-**Status: v3.0.0 — not yet compiled on TradingView.** Paste
-`asr_engine.pine` into the Pine editor and compile before deploying. Everything
-here is statically checked (delimiter balance, continuation-line indentation,
-tuple arity, dead identifiers) but nothing substitutes for the real compiler.
+**Status: v3.0.0 — not yet compiled on TradingView, parity gate not yet run.**
+Paste `asr_engine.pine` into the Pine editor and compile before deploying.
+Everything here is statically checked (delimiter balance, continuation-line
+indentation, tuple arity, dead identifiers) but nothing substitutes for the
+real compiler. The parity gate is prepared and self-tested but needs a
+Strategy Tester export from a logged-in TradingView session (see *What is not
+built yet*).
 
 ---
 
@@ -263,6 +266,7 @@ server/
   parity_test.py    Strategy Tester export vs sequential replay — the gate on everything above
   build_twin.py     generates asr_engine_bt.pine from asr_engine.pine (text transform = parity by construction)
   data/             48 symbols × 3000 daily bars (TradingView, split-adjusted)
+  data_parity/      SPY × 5000 daily bars, same feed (0 differing rows on the overlap) — longer seeding for the parity replay
 ```
 
 Reproduce: `pip install -r research/requirements.txt && cd research && python build_events.py && python analysis.py && python final_v3.py && python portfolio_sim.py`.
@@ -270,8 +274,61 @@ Regenerate the twin after any engine edit: `python research/build_twin.py` (`--c
 
 ## What is not built yet
 
-The parity gate has not yet been run — it needs a Strategy Tester export from
-a TradingView account (`research/parity_test.py` explains how).
+**The parity gate has still not been run.** It needs a Strategy Tester export
+from a logged-in TradingView session. The session that built the engine had
+no browser, and the session that prepared the gate (2026-09-13) could not
+reach tradingview.com either (egress policy), so no compile and no export
+happened. What that session did instead was make the gate runnable and its
+result attributable the moment someone with a chart exports:
+
+- **The committed gate could not have passed.** `parity_test.py` replayed the
+  Phase 2 fixed-target exits (`label_event`: TP / SL / TIME) against a twin
+  that executes the v3 exits (partial at +1 R, breakeven, chandelier 3×ATR,
+  S1 time stop). Every S3/S4 trade would have mismatched on exit. The replay
+  is now `simulate.simulate_symbol` with `engine.V3_DEPLOYED` and
+  `simulate.EXITS_V3` at the close fill — the same call behind
+  `phase3_final.md` and `phase6_fill_baseline.md` — so the gate validates the
+  trade list the findings rest on.
+- **The parser would have crashed on a current export.** TradingView's
+  header is `Price USD`, not `Price`; the parser now accepts both
+  generations, collapses the separate trade numbers TradingView assigns to a
+  partial exit into one trade per entry (keeping the final leg), and classes
+  every reason the twin can print (SL / BE / TRAIL / TIME / RESYNC / Open).
+- **The twin's execution block diverged from the engine it wraps.** Fixed in
+  `build_twin.py`, twin regenerated (`--check` clean). (1) The bracket was
+  issued only once `strategy.position_size > 0`, which under
+  `process_orders_on_close` is the bar *after* the entry — no stop or partial
+  existed during the first bar's intrabar path, while the engine and the
+  labeller treat the bracket as live from bar t+1. It is now issued on the
+  entry bar as well. (2) Time-stop exits printed `RESYNC`, because the engine
+  has already set `posSide` to 0 on the bar it exits; TIME is now taken from
+  the engine's own `evExitWhy`, and RESYNC is reserved for a genuine
+  emulator/engine disagreement.
+- **Mismatches are attributed, not just counted:** `POC_CLOSE_ATTEMPT` (the
+  engine raises the stop at a bar's close to a level at or above that close;
+  the Strategy Tester fills the re-issued stop at that close, the engine
+  exits next bar), `RESYNC`, `TIME_1BAR`, `SEQUENCE` (cascade from an earlier
+  divergence), `WINDOW_EDGE`. Per-run JSON in `research/out/`, pooled with
+  `python parity_test.py --summary`. The close-attempt class is predicted,
+  not fixed; the replay flags exposed trades and SPY has none in either
+  profile (none of 286 trades across five symbols).
+- **`python parity_test.py --selftest`** builds exports in TradingView's shape
+  from the replay itself and passes: 61/61 SWING and 22/22 POSITIONAL on SPY
+  in both header formats, and a perturbed export is attributed correctly.
+  That proves the parser, pairing, window and attribution — not parity.
+- `research/data_parity/SPY.csv` (5,000 daily bars, same feed, 0 differing
+  rows on the 3,000-bar overlap) gives the replay converged weekly EMA(50)
+  seeding from 2010-10. Window 2010-10-25 → 2026-09-11: 61 SWING and 22
+  POSITIONAL sequential trades. On the 3,000-bar file the research-window
+  trade list is identical, so seeding is not a caveat for SPY.
+
+Read the first run with this in mind: ≥ 99% on a single symbol means zero
+mismatches at n = 61 and 22, so pool several symbols before judging; a
+`RESYNC` row is the emulator disagreeing with the engine and is the first
+thing to attribute; the twin carries slippage = 1 tick, so its prices print
+one tick past the level (tolerance 1.5 ticks). There is no *only when flat*
+input on the twin — one position per chart is structural (`fireSignal`
+requires `posSide == 0`).
 
 Beyond that: the LONGTERM profile, and a separate `asr_rotation_403b.pine`
 for the retirement sleeve — that one is cross-sectional over ~20 ETFs and
