@@ -78,22 +78,26 @@ def daily_context_for(daily: pd.DataFrame, dates: np.ndarray):
         "dClose": c, "dHigh": h, "dLow": l,
         "dRoc20": np.where(ta.shift(c, 20) > 0, (c - ta.shift(c, 20)) / ta.shift(c, 20) * 100, NAN),
     })
-    # shift by one session: the context for session D is the row of the last session BEFORE D
-    feats_shift = feats.copy()
-    for col in feats.columns:
-        if col != "date":
-            feats_shift[col] = feats[col].shift(1).values
-    m = feats_shift.set_index("date")
-    # intraday sessions may include dates absent from daily (should not happen for RTH equities); reindex with ffill on the last known prior row
-    idx = pd.Index(sorted(set(dates)))
-    aligned = m.reindex(idx).ffill()
-    return aligned.reindex(dates)
+    # The context for session D is the LAST daily row with date < D — the last
+    # completed session — found by search, so it neither needs a daily row
+    # labelled D to exist (live loaders that supply completed days only) nor
+    # goes two sessions stale when a date is missing from the daily file.
+    # (Adversarial review, Phase 5: both failure modes reproduced and fixed.)
+    ddates = pd.Index(feats.date.values)
+    uniq = pd.Index(sorted(set(dates)))
+    pos = ddates.searchsorted(uniq, side="left") - 1
+    rows = feats.drop(columns="date").reset_index(drop=True)
+    picked = rows.iloc[np.clip(pos, 0, len(rows) - 1)].reset_index(drop=True)
+    picked[pos < 0] = np.nan
+    picked.index = uniq
+    return picked.reindex(dates)
 
 
 def run_intraday(bars: pd.DataFrame, daily: pd.DataFrame, spy15: pd.DataFrame, p: IntradayParams = DEFAULT) -> pd.DataFrame:
     o, h, l, c, v = (bars[k].values.astype(float) for k in "ohlcv")
     n = len(c)
     dates, slot = session_index(bars.t.values)
+    assert ((slot >= 0) & (slot < BARS_PER_DAY)).all(), "bars outside 09:30-15:45 RTH: filter the feed before running the intraday engine"
     ctx = daily_context_for(daily, dates)
     dAtr, dSma50, dSma200, dAdv, dClose = (ctx[k].values for k in ("dAtr", "dSma50", "dSma200", "dAdvUsd", "dClose"))
 
@@ -108,19 +112,20 @@ def run_intraday(bars: pd.DataFrame, daily: pd.DataFrame, spy15: pd.DataFrame, p
     vwap = np.full(n, NAN); vwsd = np.full(n, NAN); cumv = np.zeros(n)
     or_hi = np.full(n, NAN); or_lo = np.full(n, NAN); day_open = np.full(n, NAN)
     gap_pct = np.full(n, NAN); gap_atr = np.full(n, NAN)
-    s_pv = s_pv2 = s_v = 0.0; ohi = olo = NAN; dopen = NAN; prev_date = None
+    s_pv = s_pv2 = s_v = 0.0; ohi = olo = NAN; or_seen = 0; dopen = NAN; prev_date = None
     for i in range(n):
         if dates[i] != prev_date:
-            s_pv = s_pv2 = s_v = 0.0; ohi = -np.inf; olo = np.inf; dopen = o[i]; prev_date = dates[i]
+            s_pv = s_pv2 = s_v = 0.0; ohi = -np.inf; olo = np.inf; or_seen = 0; dopen = o[i]; prev_date = dates[i]
         s_pv += hlc3[i] * v[i]; s_pv2 += hlc3[i] ** 2 * v[i]; s_v += v[i]
         if s_v > 0:
             vwap[i] = s_pv / s_v
             vwsd[i] = np.sqrt(max(0.0, s_pv2 / s_v - vwap[i] ** 2))
         cumv[i] = s_v
         if slot[i] < p.or_bars:
-            ohi = max(ohi, h[i]); olo = min(olo, l[i])
-        # OR is usable only once complete (from slot or_bars onward)
-        if slot[i] >= p.or_bars:
+            ohi = max(ohi, h[i]); olo = min(olo, l[i]); or_seen += 1
+        # OR is usable only once complete AND every OR bar was actually observed
+        # (a session missing its first bars must not fire on a ±inf sentinel)
+        if slot[i] >= p.or_bars and or_seen == p.or_bars:
             or_hi[i] = ohi; or_lo[i] = olo
         day_open[i] = dopen
         if not np.isnan(dClose[i]) and dClose[i] > 0:
@@ -128,6 +133,10 @@ def run_intraday(bars: pd.DataFrame, daily: pd.DataFrame, spy15: pd.DataFrame, p
             gap_atr[i] = (dopen - dClose[i]) / dAtr[i] if not np.isnan(dAtr[i]) and dAtr[i] > 0 else NAN
 
     # ── time-of-day relative volume: EWMA per slot over PRIOR days ──
+    # Short sessions (early closes) carry the closing auction in a mid-day slot;
+    # their bars are read but do not update the slot averages (exchange calendar
+    # in Pine; session length in the backtest).
+    sess_len = pd.Series(slot).groupby(dates).transform("size").values
     slot_ewma = np.full(BARS_PER_DAY, NAN); cum_ewma = np.full(BARS_PER_DAY, NAN)
     rvol_tod = np.full(n, NAN); rvol_cum = np.full(n, NAN)
     for i in range(n):
@@ -138,17 +147,17 @@ def run_intraday(bars: pd.DataFrame, daily: pd.DataFrame, spy15: pd.DataFrame, p
             if not np.isnan(cum_ewma[s]) and cum_ewma[s] > 0:
                 rvol_cum[i] = cumv[i] / cum_ewma[s]
             # update AFTER use — the bar never sees its own day
-            slot_ewma[s] = v[i] if np.isnan(slot_ewma[s]) else slot_ewma[s] + p.tod_alpha * (v[i] - slot_ewma[s])
-            cum_ewma[s] = cumv[i] if np.isnan(cum_ewma[s]) else cum_ewma[s] + p.tod_alpha * (cumv[i] - cum_ewma[s])
+            if sess_len[i] == BARS_PER_DAY:
+                slot_ewma[s] = v[i] if np.isnan(slot_ewma[s]) else slot_ewma[s] + p.tod_alpha * (v[i] - slot_ewma[s])
+                cum_ewma[s] = cumv[i] if np.isnan(cum_ewma[s]) else cum_ewma[s] + p.tod_alpha * (cumv[i] - cum_ewma[s])
 
     # ── relative strength vs SPY (session-anchored and 20-bar) ──
     spy = spy15.set_index("t").reindex(bars.t.values)
-    sc = spy.c.values.astype(float)
-    spy_dates, _ = session_index(bars.t.values)
+    sc, so_ = spy.c.values.astype(float), spy.o.values.astype(float)
     spy_open = np.full(n, NAN); prev_date = None; so = NAN
     for i in range(n):
-        if spy_dates[i] != prev_date:
-            so = sc[i]; prev_date = spy_dates[i]
+        if dates[i] != prev_date:
+            so = so_[i]; prev_date = dates[i]          # SPY's session OPEN, mirroring the symbol's day_open
         spy_open[i] = so
     with np.errstate(invalid="ignore", divide="ignore"):
         rs_sess = (c / day_open) / (sc / spy_open) - 1.0
@@ -190,7 +199,7 @@ def run_intraday(bars: pd.DataFrame, daily: pd.DataFrame, spy15: pd.DataFrame, p
 
     # ── S3i: recent EMA cross, above VWAP, uptrend ──
     with np.errstate(invalid="ignore"):
-        s3_trig = same_day & ~np.isnan(bs_up) & (bs_up <= p.s3_cross_max) & (c > vwap) & (slot >= p.or_bars) & (slot <= p.last_entry_slot)
+        s3_trig = same_day & ~np.isnan(bs_up) & (bs_up <= p.s3_cross_max) & (bs_up <= slot) & (c > vwap) & (slot >= p.or_bars) & (slot <= p.last_entry_slot)
         s3_elig = s3_trig & trend_up
 
     # ── initial stops: strategy geometry, floored and capped ──
@@ -208,16 +217,21 @@ def run_intraday(bars: pd.DataFrame, daily: pd.DataFrame, spy15: pd.DataFrame, p
     risk = np.abs(entry - stop)
     tp = ta.round_to_mintick(c + 2.0 * risk, p.mintick)          # reference 2R target for the fixed-target exit model
 
-    warm = (np.arange(n) >= 60) & ~np.isnan(atr) & ~np.isnan(dAtr) & ~np.isnan(dSma200) & ~np.isnan(rvol_cum)
-    eligible = warm & (best > 0) & liquidity & (slot <= p.last_entry_slot) & (risk > 0)
-
-    # index of the last bar of each session (EOD flat target)
+    # index of the last bar of each session (EOD flat target). This is a label
+    # rule, not a feature: "flat at the session's last bar" is causal at that
+    # bar (session.islastbar / the exchange calendar in Pine).
     eod_idx = np.full(n, -1)
     last_of_day = {}
     for i in range(n):
         last_of_day[dates[i]] = i
     for i in range(n):
         eod_idx[i] = last_of_day[dates[i]]
+    bars_left = eod_idx - np.arange(n)
+
+    warm = (np.arange(n) >= 60) & ~np.isnan(atr) & ~np.isnan(dAtr) & ~np.isnan(dSma200) & ~np.isnan(rvol_cum)
+    # Entries are gated RELATIVE to the session end (≥ 3 bars left), so an early
+    # close cannot admit a trade on its last bars and hold it overnight.
+    eligible = warm & (best > 0) & liquidity & (slot <= p.last_entry_slot) & (bars_left >= 3) & (risk > 0)
 
     out = pd.DataFrame({
         "t": bars.t.values, "date": dates, "slot": slot, "o": o, "h": h, "l": l, "c": c, "v": v,
@@ -227,7 +241,7 @@ def run_intraday(bars: pd.DataFrame, daily: pd.DataFrame, spy15: pd.DataFrame, p
         "dAtr": dAtr, "dSma200": dSma200, "dAdvUsd": dAdv, "dRoc20": ctx["dRoc20"].values,
         "s5_trig": s5_trig, "s5_elig": s5_elig, "s6_trig": s6_trig, "s6_elig": s6_elig, "s3_trig": s3_trig, "s3_elig": s3_elig,
         "s5_stopD": s5_stopD, "s6_stopD": s6_stopD, "s3_stopD": s3_stopD,
-        "best": best, "entry": entry, "stop": stop, "risk": risk, "tp": tp, "eligible": eligible, "eod_idx": eod_idx,
+        "best": best, "entry": entry, "stop": stop, "risk": risk, "tp": tp, "eligible": eligible, "eod_idx": eod_idx, "bars_left": bars_left,
         "liquidity": liquidity, "warm": warm,
     })
     return out

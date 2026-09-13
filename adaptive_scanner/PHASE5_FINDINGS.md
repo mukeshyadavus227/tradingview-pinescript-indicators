@@ -33,10 +33,10 @@ trigger events.
 
 | | n train | mean R train | n test | mean R test | hit test | PF test |
 |---|---:|---:|---:|---:|---:|---:|
-| S5 ORB | 247 | +0.065 | 70 | −0.370 | 24% | 0.42 |
-| S6 VWAP reclaim | 1,644 | −0.079 | 623 | −0.230 | 36% | 0.62 |
-| S3i EMA cross | 5,795 | −0.046 | 2,559 | −0.328 | 32% | 0.46 |
-| **random-entry control** (same slots, same geometry, same exit) | 12,988 | **−0.104** | 6,212 | **−0.194** | 39% | |
+| S5 ORB | 215 | +0.038 | 70 | −0.370 | 24% | 0.42 |
+| S6 VWAP reclaim | 1,634 | −0.078 | 623 | −0.230 | 36% | 0.62 |
+| S3i EMA cross | 5,740 | −0.044 | 2,539 | −0.332 | 32% | 0.45 |
+| **random-entry control** (same slots, same geometry, same exit) | 12,972 | **−0.109** | 6,228 | **−0.197** | 39% | |
 
 Gross of costs the three are approximately zero (S5 +0.03, S6 −0.01, S3i
 −0.03 R); 5 bps turns zero into loss. The control is the important row:
@@ -45,8 +45,8 @@ open-to-close drift in this window is negative (SPY +1.6% over the test
 period, all of it overnight; mean open→close −0.04%, 44% up-days) and the
 EOD flat forgoes the overnight premium every day.
 
-**Alpha relative to the control:** S5 +0.17 R in train, −0.18 R in test
-(n = 70 — not a result, a coin). S6 +0.03 / −0.04. S3i +0.06 / −0.13.
+**Alpha relative to the control:** S5 +0.15 R in train, −0.17 R in test
+(n = 70 — not a result, a coin). S6 +0.03 / −0.03. S3i +0.07 / −0.14.
 Nothing stable.
 
 **Exit models:** every EOD-flat variant is within noise of the others.
@@ -94,4 +94,46 @@ a new profile. It is the candidate for Phase 6.
 
 ## 5. Mirror review
 
-_(filled in from the adversarial review workflow)_
+An adversarial workflow read `engine_intraday.py` through three lenses
+(look-ahead leakage, session/time handling, Pine portability); every
+candidate was then attacked by two independent skeptics told to refute it.
+41 agents. 19 candidates → 13 confirmed, 1 contested, 5 refuted. The
+verifiers reproduced each confirmed finding numerically against the files.
+
+**Leakage: none.** The engine's arrays are causal (verified by prefix
+truncation: every column except the EOD-flat index is identical for bars up
+to a cut). The daily-context mapping was confirmed to deliver the prior
+completed session in 9,264 of 9,264 symbol-sessions; one latent staleness
+mode (a missing daily row, or a live loader that omits today's row, made the
+context one session *older*, never newer) was fixed by mapping each session
+to the last daily row strictly before it.
+
+**Session handling — fixed:**
+- *Major.* Absolute entry cutoffs let a half-day admit a trade on its final
+  bars and hold it overnight. Entries are now gated relative to the session
+  end (≥ 3 bars left).
+- Opening range initialised to ±inf, so a session missing its first bars
+  would "break out" over a sentinel; now NaN unless every OR bar was seen.
+- The S3i "cross within 3 bars" window spanned the overnight gap; the cross
+  must now be in the current session.
+- Session RS anchored the symbol on its open and SPY on its first close; both
+  now use the open.
+- A short session's closing auction contaminated the per-slot volume EWMA for
+  ~10 sessions; short sessions no longer update the averages.
+- A slot-range assertion so an extended-hours feed fails loudly.
+
+**Contested (1):** the EOD-flat index is derived from later bars. It is a
+label rule ("flat at the session's last bar"), causal at that bar and
+expressible in Pine via the session calendar; left as is, documented.
+
+**Effect on the results:** S5 train +0.065 → +0.038 (n 247 → 215); every
+other cell moved by < 0.01 R; the control is unchanged. The verdict does not
+depend on any of it.
+
+**Pine portability (had the profile shipped):** session VWAP + stdev bands
+map to `ta.vwap(hlc3, timeframe.change("1D"), 1)`; the time-of-day EWMA is a
+`var` array indexed by slot, read then updated on `barstate.isconfirmed`,
+with a per-slot observation count replacing the 60-bar warm gate; the OR
+latch must consume on the raw break, not the gated one; session RS needs
+`request.security("SPY", timeframe.period, open)` latched on the new day.
+None of this was built.

@@ -41,7 +41,7 @@ def build_events(syms):
         o, h, l, c = (b15[k].values.astype(float) for k in "ohlc")
         atr, tm = d.atr.values, b15.t.values.astype(np.int64) * 1000
         for k, trig_col, elig_col, stop_col in ((5, "s5_trig", "s5_elig", "s5_stopD"), (6, "s6_trig", "s6_elig", "s6_stopD"), (3, "s3_trig", "s3_elig", "s3_stopD")):
-            idx = np.where(d[trig_col].values & d.warm.values & d.liquidity.values)[0]
+            idx = np.where(d[trig_col].values & d.warm.values & d.liquidity.values & (d.bars_left.values >= 3))[0]
             for t in idx:
                 entry = round(c[t], 2); stop = round(c[t] - d[stop_col].values[t], 2); risk = entry - stop
                 if risk <= 0:

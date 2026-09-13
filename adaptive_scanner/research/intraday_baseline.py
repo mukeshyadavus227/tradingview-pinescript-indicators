@@ -13,7 +13,7 @@ for p in sorted(D15.glob("*.csv.gz")):
     sym = p.stem.replace(".csv", "")
     b = pd.read_csv(p); d = run_intraday(b, pd.read_csv(DD / f"{sym}.csv"), spy)
     o, h, l, c = (b[k].values.astype(float) for k in "ohlc"); atr, tm = d.atr.values, b.t.values.astype(np.int64) * 1000
-    idx = np.where(d.warm.values & d.liquidity.values & (d.slot.values >= 2) & (d.slot.values <= 22))[0]
+    idx = np.where(d.warm.values & d.liquidity.values & (d.slot.values >= 2) & (d.slot.values <= 22) & (d.bars_left.values >= 3))[0]
     idx = rng.choice(idx, size=min(400, len(idx)), replace=False)      # 400 random bars per symbol
     for t in idx:
         entry = round(c[t], 2); stop = round(c[t] - d.s3_stopD.values[t], 2); risk = entry - stop

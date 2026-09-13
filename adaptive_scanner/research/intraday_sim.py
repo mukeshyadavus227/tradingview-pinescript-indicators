@@ -31,7 +31,7 @@ def sequential(sym, d, b15, model, cost_bps, cooldown_bars=3, max_per_day=3, pri
     trades, busy_until, last_t, per_day = [], -1, -10 ** 9, {}
     elig = {5: d.s5_elig.values, 6: d.s6_elig.values, 3: d.s3_elig.values}
     stopD = {5: d.s5_stopD.values, 6: d.s6_stopD.values, 3: d.s3_stopD.values}
-    for t in np.where(d.warm.values & d.liquidity.values & (d.slot.values <= DEFAULT.last_entry_slot))[0]:
+    for t in np.where(d.warm.values & d.liquidity.values & (d.slot.values <= DEFAULT.last_entry_slot) & (d.bars_left.values >= 3))[0]:
         k = next((kk for kk in priority if elig[kk][t]), 0)
         if k == 0 or t <= busy_until or t - last_t < cooldown_bars or per_day.get(d.date.values[t], 0) >= max_per_day:
             continue
