@@ -61,7 +61,6 @@ MERGE_ATR1 = 0.25     # TP candidates closer than this collapse
 TP_OFFSET_TICKS = 2   # TP sits 2 ticks under the level
 SL_OFFSET_TICKS = 1   # SL sits 1 tick under the anchor
 ZONE_LEAVE_TOL = 2.0  # AT_ZONE ends when close > z* + 2 tol without a rejection
-ZINV_LOOKDOWN_TOL = 3.0  # Zinv defends the lowest candidate within 3 tol below z*
 WEEKEND_GAP_MIN = 120    # a bar gap longer than this is a weekend/holiday
 WARM_15M_BARS = 100
 
@@ -398,9 +397,12 @@ def run(bars15: Bars, p: Params | None = None) -> Result:
                         merged.append((z, k, pr))
                 z_star, kind_star, _ = merged[0]          # lowest qualifying level
                 tol_star = tol
-                # Zinv defends the lowest candidate within 3 tol below z*
-                low_c = min([z for (z, _, _) in cands if z_star - ZINV_LOOKDOWN_TOL * tol <= z <= z_star] + [z_star])
-                zinv = low_c - tol_star
+                # The setup is invalid once price closes a full tolerance below
+                # the level it was testing. An earlier version also looked down
+                # at nearby untouched candidates and pushed the invalidation
+                # under the lowest of them; that widened every stop-fallback and
+                # was a rule nobody asked for, so it is gone.
+                zinv = z_star - tol_star
                 arm_bar, rl, rl_bar = i, l[i], i
                 state = AT_ZONE
                 ev(i, "ARM", level=float(z_star), kind=kind_star, tol=float(tol_star), zinv=float(zinv))
