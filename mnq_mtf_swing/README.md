@@ -215,8 +215,10 @@ present; with none, these are market orders.
 
 **SignalStack's payload schema has no bracket, OCO, stop-loss or take-profit
 field.** `limit_price` and `stop_price` describe the *entry* order type, not an
-attached exit. So the stop and target cannot travel with the entry: the **SL and
-TP alerts from this script are the exits**. Three consequences:
+attached exit. So the stop and target cannot travel with the entry: the **exit
+alerts from this script are the exits**. There are three of them — stop hit,
+target hit, and the roll-window close — and all three send the same exit action.
+Three consequences:
 
 * If TradingView misses a bar, your alert expires, or the webhook fails, the
   position has **no protective order at the broker**. Set a broker-side maximum

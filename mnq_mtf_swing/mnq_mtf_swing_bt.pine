@@ -322,23 +322,48 @@ f_touch(float lvl) =>
     not na(lvl) and low <= lvl + tol and close >= lvl - tol
 
 // The LOWEST qualifying candidate wins because it gives the most conservative
-// invalidation. Candidates are evaluated in priority order and only displaced
-// by a level lower than the incumbent by more than the tolerance, so two levels
-// that coincide keep the higher-priority kind.
+// invalidation. Candidates within one tolerance of the lowest collapse into it:
+// the group keeps the LOWEST price and the HIGHEST-priority kind. Taking the
+// higher-priority level's own price instead would put the zone, and with it the
+// invalidation and the fallback stop, a full tolerance too high.
+array<float> czP = array.new<float>()
+array<int>   czK = array.new<int>()
+if f_touch(risingPL)
+    array.push(czP, risingPL)
+    array.push(czK, 0)
+if f_touch(brkLvl)
+    array.push(czP, brkLvl)
+    array.push(czK, 1)
+if f_touch(ef1)
+    array.push(czP, ef1)
+    array.push(czK, 2)
+if f_touch(es1)
+    array.push(czP, es1)
+    array.push(czK, 3)
+
+if array.size(czP) > 1
+    for a = 1 to array.size(czP) - 1
+        float kv = array.get(czP, a)
+        int   kk = array.get(czK, a)
+        int   b  = a - 1
+        while b >= 0 and array.get(czP, b) > kv
+            array.set(czP, b + 1, array.get(czP, b))
+            array.set(czK, b + 1, array.get(czK, b))
+            b -= 1
+        array.set(czP, b + 1, kv)
+        array.set(czK, b + 1, kk)
+
 float bestLvl = na
 int bestKind = -1
-if f_touch(risingPL)
-    bestLvl := risingPL
-    bestKind := 0
-if f_touch(brkLvl) and (na(bestLvl) or brkLvl < bestLvl - tol)
-    bestLvl := brkLvl
-    bestKind := 1
-if f_touch(ef1) and (na(bestLvl) or ef1 < bestLvl - tol)
-    bestLvl := ef1
-    bestKind := 2
-if f_touch(es1) and (na(bestLvl) or es1 < bestLvl - tol)
-    bestLvl := es1
-    bestKind := 3
+if array.size(czP) > 0
+    bestLvl  := array.get(czP, 0)
+    bestKind := array.get(czK, 0)
+    // Guarded on > 1: in Pine `for j = 1 to 0` counts DOWNWARD and would read
+    // past the end of a single-element array.
+    if array.size(czP) > 1
+        for j = 1 to array.size(czP) - 1
+            if array.get(czP, j) - bestLvl <= tol and array.get(czK, j) < bestKind
+                bestKind := array.get(czK, j)
 
 kindName(int k) => k == 0 ? "PL" : k == 1 ? "BRK" : k == 2 ? "EMA20" : k == 3 ? "EMA50" : "-"
 
@@ -370,22 +395,32 @@ f_highestBetween(int fromOff, int toOff) =>
 
 // Calendar helpers, computed from the bar time alone so the rule is identical
 // anywhere: the quarterly expiry is the third Friday of Mar/Jun/Sep/Dec.
+// Everything here is resolved in exchange time, and the comparison is
+// date-to-date rather than timestamp-to-timestamp: expiry day itself is inside
+// the window, which a naive compare against the bar time would lose from the
+// first bar after midnight.
+const string TZ = "America/Chicago"
+
 f_thirdFriday(int y, int m) =>
-    int firstDow = dayofweek(timestamp(y, m, 1, 0, 0))
+    int firstDow = dayofweek(timestamp(TZ, y, m, 1, 0, 0), TZ)
     int offset   = (6 - firstDow + 7) % 7
-    timestamp(y, m, 1 + offset + 14, 0, 0)
+    timestamp(TZ, y, m, 1 + offset + 14, 0, 0)
+
+f_barMidnight() =>
+    timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), 0, 0)
 
 f_nextExpiry() =>
-    int y  = year(time)
-    int m  = month(time)
-    int qm = m <= 3 ? 3 : m <= 6 ? 6 : m <= 9 ? 9 : 12
-    int e  = f_thirdFriday(y, qm)
-    if e < time
+    int y     = year(time, TZ)
+    int m     = month(time, TZ)
+    int qm    = m <= 3 ? 3 : m <= 6 ? 6 : m <= 9 ? 9 : 12
+    int e     = f_thirdFriday(y, qm)
+    if e < f_barMidnight()
         e := qm == 12 ? f_thirdFriday(y + 1, 3) : f_thirdFriday(y, qm + 3)
     e
 
-inRoll     = rollDays > 0 and (f_nextExpiry() - time) <= rollDays * 86400000
-lastBarSes = hour(time, "America/Chicago") == 15 and minute(time, "America/Chicago") == 45
+daysToExpiry = math.round((f_nextExpiry() - f_barMidnight()) / 86400000.0)
+inRoll     = rollDays > 0 and daysToExpiry <= rollDays
+lastBarSes = hour(time, TZ) == 15 and minute(time, TZ) == 45
 inWindow   = not useSess or not na(time(timeframe.period, sessWin))
 weekendGap = bar_index > 0 and (time - time[1]) > 120 * 60 * 1000
 
@@ -426,7 +461,7 @@ var string skipTxt   = ""
 
 warmOk = not na(atr15) and not na(atr1) and not na(atr4) and not na(es4p) and not na(es1p) and
      not na(h24) and not na(vSlow) and array.size(ph4P) >= 2 and array.size(pl4P) >= 2 and
-     array.size(pl1P) >= 2 and bar_index >= 100
+     array.size(pl1P) >= 2 and array.size(ph1P) >= 1 and bar_index >= 100
 
 // ---- exit watch ----------------------------------------------------------
 // Evaluated on EVERY tick from the values committed on the previous bar, and
@@ -434,9 +469,13 @@ warmOk = not na(atr15) and not na(atr1) and not na(atr4) and not na(es4p) and no
 // or TP alert fire when the level actually trades instead of at bar close, and
 // it is why the alert cannot be swallowed by the state machine resetting on the
 // same tick.
+// The ladder matches the confirmed-bar exit rules exactly: a gap through either
+// level beats a touch, and a touch of the stop beats a touch of the target.
 watching = state == ST_TRADE and bar_index > entryBar and not na(slPx) and not na(tpPx)
-slTouch  = watching and (open <= slPx or low <= slPx)
-tpTouch  = watching and not slTouch and (open >= tpPx or high >= tpPx)
+slGap    = watching and open <= slPx
+tpGap    = watching and not slGap and open >= tpPx
+slTouch  = watching and (slGap or (not tpGap and low <= slPx))
+tpTouch  = watching and not slTouch and (tpGap or high >= tpPx)
 
 bool entryFired = false
 bool skipFired  = false
@@ -545,7 +584,11 @@ if barstate.isconfirmed
                 float sl   = math.round_to_mintick(hl) - syminfo.mintick
                 float rsk  = ent - sl
                 string src = "HL"
-                string rsn = ""
+                // The roll window ENDS the setup rather than deferring it: the
+                // contract is about to change under the levels, so waiting for
+                // the window to close and entering on a ratcheted swing high
+                // would be a different trade from the one that was set up.
+                string rsn = inRoll ? "ROLL_WINDOW" : ""
                 if rsk < flr
                     float sl2 = math.round_to_mintick(zInv) - syminfo.mintick
                     if ent - sl2 >= flr
@@ -597,17 +640,38 @@ if barstate.isconfirmed
                             array.set(lv, b + 1, kv)
                             array.set(st, b + 1, ks)
                             array.set(nm, b + 1, kn)
-                    float minLv = ent + 3 * syminfo.mintick
+                    // Collapse candidates within a quarter of a 1H ATR. The
+                    // group keeps the LOWER price and becomes strong if any
+                    // member is strong, so a weak 1H high sitting just under a
+                    // 4H wall still vetoes the trade instead of letting the
+                    // scan step over it to the level above.
+                    array<float>  mlv = array.new<float>()
+                    array<bool>   mst = array.new<bool>()
+                    array<string> mnm = array.new<string>()
                     if array.size(lv) > 0
                         for j = 0 to array.size(lv) - 1
                             float level = array.get(lv, j)
+                            int last = array.size(mlv) - 1
+                            if last >= 0 and level - array.get(mlv, last) <= 0.25 * atr1
+                                if array.get(st, j) and not array.get(mst, last)
+                                    array.set(mst, last, true)
+                                    array.set(mnm, last, array.get(nm, j))
+                            else
+                                array.push(mlv, level)
+                                array.push(mst, array.get(st, j))
+                                array.push(mnm, array.get(nm, j))
+
+                    float minLv = ent + 3 * syminfo.mintick
+                    if array.size(mlv) > 0
+                        for j = 0 to array.size(mlv) - 1
+                            float level = array.get(mlv, j)
                             if na(tp) and rsn == "" and level > minLv
                                 float cand = math.round_to_mintick(level) - 2 * syminfo.mintick
                                 float rr   = (cand - ent) / rsk
                                 if rr >= minRR
                                     tp   := cand
-                                    tsrc := array.get(nm, j)
-                                else if array.get(st, j)
+                                    tsrc := array.get(mnm, j)
+                                else if array.get(mst, j)
                                     rsn := "TP_STRONG_WALL"
                     if rsn == "" and na(tp)
                         tp   := math.round_to_mintick(ent + fallbackRR * rsk)
@@ -617,7 +681,7 @@ if barstate.isconfirmed
 
                 // A deferral does not end the setup; the stage timer keeps
                 // running and the reference high ratchets.
-                bool defer = lastBarSes or not inWindow or inRoll
+                bool defer = lastBarSes or not inWindow
                 if defer
                     sh := math.max(sh, high)
                 else if rsn != ""
@@ -671,6 +735,11 @@ if slTouch
     alert(f_payload(whExit, "SL"), alert.freq_once_per_bar)
 if tpTouch
     alert(f_payload(whExit, "TP"), alert.freq_once_per_bar)
+// A roll-window exit is a real exit: without this the script would go flat
+// internally, stop watching the levels, and leave the position open at the
+// broker with nothing left to close it.
+if exitFired and not slTouch and not tpTouch
+    alert(f_payload(whExit, "ROLL"), alert.freq_once_per_bar_close)
 
 // Plain-text conditions for a second, non-SignalStack notification channel.
 alertcondition(entryFired, "Entry (diagnostic)", "MNQ MTF long entry {{ticker}} @ {{close}}")

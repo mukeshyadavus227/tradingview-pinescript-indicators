@@ -24,10 +24,12 @@ State machine (15M): IDLE -> AT_ZONE -> REJECTED -> HL_OK -> IN_TRADE -> IDLE.
 Within one closed bar the evaluation order is fixed:
   (0) IN_TRADE exit branch (only if the bar STARTED in trade; an exit bar never re-arms)
   (1) global resets for states 1..3 (4H lost, 1H trend lost, close below Zinv, weekend gap)
-  (2) 15M pivot-low step (a pivot confirmed on this bar may promote REJECTED -> HL_OK or raise HL)
-  (3) undercut checks (low below RL / below HL)
-  (4) stage timeout
-  (5) arm / rejection / break -> entry gate
+  (2) arm (IDLE -> AT_ZONE) when a zone candidate is tested
+  (3) 15M pivot-low step (a pivot confirmed on this bar may promote REJECTED -> HL_OK or raise HL)
+  (4) the AT_ZONE block (track the low, leave-zone, timeout, rejection candle)
+  (5) undercut checks (low below RL / below HL)
+  (6) stage timeout
+  (7) break -> entry gate
 A bar may pass IDLE -> AT_ZONE -> REJECTED, or REJECTED -> HL_OK -> IN_TRADE, in one pass.
 """
 from __future__ import annotations
@@ -53,8 +55,7 @@ ATR_LEN = 14          # every ATR
 H24_LEN = 24          # 1H bars: the high the pullback came from
 PULLBACK_ATR = 0.5    # S2: H24 - C1 >= 0.5 x ATR1
 VOL_FAST, VOL_SLOW = 5, 20
-RING_K = 8            # pivots kept per side per timeframe
-WINDOW_HTF = 240      # HTF bars: pivots older than this are ignored
+RING_K = 8            # pivots kept per side per timeframe; this depth IS the age bound
 FLOOR_ATR15 = 0.5     # minimum risk = max(0.5 x ATR15, 4 ticks)
 FLOOR_TICKS = 4
 MERGE_ATR1 = 0.25     # TP candidates closer than this collapse
@@ -157,7 +158,13 @@ def build_htf(bars15: Bars, minutes: int, p: Params) -> HTFContext:
 
 
 def in_window(rings: list[Piv], ref: int) -> list[Piv]:
-    return [x for x in rings if ref - x.idx <= WINDOW_HTF]
+    """Pivots usable at reference bar `ref`.
+
+    The ring depth (RING_K) is the only bound: a support or resistance level
+    does not expire just because it is old, and an extra age cutoff was a
+    second knob measuring the same thing.
+    """
+    return list(rings)
 
 
 # --------------------------------------------------------------------------------------
@@ -182,7 +189,7 @@ def next_expiry(d: date) -> date:
 def in_roll_window(t_unix: int, roll_block_days: int) -> bool:
     if roll_block_days <= 0:
         return False
-    d = datetime.fromtimestamp(int(t_unix), ET).date()
+    d = datetime.fromtimestamp(int(t_unix), CT).date()   # exchange timezone, as in Pine
     return (next_expiry(d) - d).days <= roll_block_days
 
 
@@ -262,7 +269,7 @@ def run(bars15: Bars, p: Params | None = None) -> Result:
     state = IDLE
     z_star = tol_star = zinv = np.nan
     kind_star = ""
-    arm_bar = rl_bar = rej_bar = hl_bar = stage_bar = entry_bar = -1
+    arm_bar = rl_bar = hl_bar = stage_bar = entry_bar = -1
     rl = hl = sh = np.nan
     last_event_bar = -1
     guard_ref1 = -1          # arming blocked until ref1 != guard_ref1
@@ -276,7 +283,6 @@ def run(bars15: Bars, p: Params | None = None) -> Result:
     for i in range(n):
         r4 = h4.map_idx[i] - 1
         r1 = h1.map_idx[i] - 1
-        exited_this_bar = False
 
         # ---------- (0) IN_TRADE exit branch ----------
         if state == IN_TRADE:
@@ -303,7 +309,6 @@ def run(bars15: Bars, p: Params | None = None) -> Result:
                     state = IDLE
                     last_event_bar = i
                     guard_ref1 = r1
-                    exited_this_bar = True
                     cur = None
             state_arr[i] = state
             if state == IN_TRADE:
@@ -434,7 +439,7 @@ def run(bars15: Bars, p: Params | None = None) -> Result:
                 last_event_bar = i
             elif rejection(i):
                 state = REJECTED
-                rej_bar = stage_bar = i
+                stage_bar = i
                 ev(i, "REJECT", rl=float(rl))
 
         # ---------- (3)/(4) REJECTED and HL_OK undercut + timeout ----------
@@ -444,7 +449,7 @@ def run(bars15: Bars, p: Params | None = None) -> Result:
                 rl, rl_bar = l[i], i
                 if rejection(i):
                     state = REJECTED
-                    rej_bar = stage_bar = i
+                    stage_bar = i
                     ev(i, "REJECT", rl=float(rl), note="re-reject")
                 else:
                     state = AT_ZONE
