@@ -144,7 +144,7 @@ showDash  = input.bool(true, "Show dashboard", group = GD)
 // every bar to its right. Of two equal highs the EARLIER one is the pivot, so a
 // level is never counted twice. Written out rather than using ta.pivothigh so
 // that the tie rule is explicit and the Python mirror can match it exactly.
-f_pivHigh(int piv) =>
+f_pivHigh(simple int piv) =>
     float p  = high[piv]
     bool  ok = true
     for k = 1 to piv
@@ -154,7 +154,7 @@ f_pivHigh(int piv) =>
             ok := false
     ok ? p : na
 
-f_pivLow(int piv) =>
+f_pivLow(simple int piv) =>
     float p  = low[piv]
     bool  ok = true
     for k = 1 to piv
@@ -168,7 +168,7 @@ f_pivLow(int piv) =>
 // call site this is the last CONFIRMED higher-timeframe bar, identical on
 // historical and realtime bars. eS[4] is the slow EMA three closed bars before
 // the reference bar, which is the slope test.
-f_ctx4(int lenF, int lenS, int piv) =>
+f_ctx4(simple int lenF, simple int lenS, simple int piv) =>
     float eF  = ta.ema(close, lenF)
     float eS  = ta.ema(close, lenS)
     float a   = ta.atr(14)
@@ -177,7 +177,7 @@ f_ctx4(int lenF, int lenS, int piv) =>
     float prv = ta.highest(high, piv)
     [close[1], eF[1], eS[1], eS[4], a[1], ph[1], pl[1], prv[1], bar_index[1]]
 
-f_ctx1(int lenF, int lenS, int piv) =>
+f_ctx1(simple int lenF, simple int lenS, simple int piv) =>
     float eF  = ta.ema(close, lenF)
     float eS  = ta.ema(close, lenS)
     float a   = ta.atr(14)
@@ -194,10 +194,12 @@ f_ctx1(int lenF, int lenS, int piv) =>
 [c1, ef1, es1, es1p, atr1, h24, vFast, vSlow, newPh1, newPl1, biRaw1] =
      request.security(syminfo.tickerid, "60", f_ctx1(emaFast, emaSlow, pivHTF), lookahead = barmerge.lookahead_on)
 
-// request.security hands numeric values back as floats; the ring bookkeeping
-// below indexes with them, so they are cast once here.
-bi4 = na(biRaw4) ? -1 : int(biRaw4)
-bi1 = na(biRaw1) ? -1 : int(biRaw1)
+// Normalised once so the ring bookkeeping below can compare them as indices.
+// math.round rather than int(): truncation on a value a hair under the integer
+// would make the bar-index equality below never trip, silently dropping a whole
+// higher-timeframe bar's pivots.
+bi4 = na(biRaw4) ? -1 : math.round(biRaw4)
+bi1 = na(biRaw1) ? -1 : math.round(biRaw1)
 
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
@@ -324,7 +326,9 @@ if array.size(czP) > 1
         float kv = array.get(czP, a)
         int   kk = array.get(czK, a)
         int   b  = a - 1
-        while b >= 0 and array.get(czP, b) > kv
+        while b >= 0
+            if array.get(czP, b) <= kv
+                break
             array.set(czP, b + 1, array.get(czP, b))
             array.set(czK, b + 1, array.get(czK, b))
             b -= 1
@@ -351,7 +355,7 @@ kindName(int k) => k == 0 ? "PL" : k == 1 ? "BRK" : k == 2 ? "EMA20" : k == 3 ? 
 // ╚══════════════════════════════════════════════════════════════════════════╝
 atr15 = ta.atr(14)
 
-f_pl15(int piv) =>
+f_pl15(simple int piv) =>
     float p  = low[piv]
     bool  ok = true
     for k = 1 to piv
@@ -473,6 +477,9 @@ if barstate.isconfirmed
             else if high >= tpPx
                 why := "TP"
             else if inRoll and not lastBarSes
+                // Close out before the contract changes under the levels. Not
+                // on the bar closing into the halt: that market exit would have
+                // no market to fill in, so it waits for the reopen.
                 why := "ROLL"
             if why != ""
                 exitFired := true
@@ -599,7 +606,7 @@ if barstate.isconfirmed
                         array.push(nm, "4H-PROV")
                     if array.size(ph1P) > 0
                         for j = 0 to array.size(ph1P) - 1
-                            if array.get(ph1P, j) != h24
+                            if math.abs(array.get(ph1P, j) - h24) > syminfo.mintick / 2
                                 array.push(lv, array.get(ph1P, j))
                                 array.push(st, false)
                                 array.push(nm, "1H-PH")
@@ -610,7 +617,9 @@ if barstate.isconfirmed
                             bool   ks = array.get(st, a)
                             string kn = array.get(nm, a)
                             int    b  = a - 1
-                            while b >= 0 and array.get(lv, b) > kv
+                            while b >= 0
+                                if array.get(lv, b) <= kv
+                                    break
                                 array.set(lv, b + 1, array.get(lv, b))
                                 array.set(st, b + 1, array.get(st, b))
                                 array.set(nm, b + 1, array.get(nm, b))
@@ -628,13 +637,16 @@ if barstate.isconfirmed
                     array<string> mnm = array.new<string>()
                     if array.size(lv) > 0
                         for j = 0 to array.size(lv) - 1
-                            float level = array.get(lv, j)
-                            int last = array.size(mlv) - 1
-                            if last >= 0 and level - array.get(mlv, last) <= 0.25 * atr1
-                                if array.get(st, j) and not array.get(mst, last)
-                                    array.set(mst, last, true)
-                                    array.set(mnm, last, array.get(nm, j))
-                            else
+                            float level  = array.get(lv, j)
+                            bool  merged = false
+                            if array.size(mlv) > 0
+                                int last = array.size(mlv) - 1
+                                if level - array.get(mlv, last) <= 0.25 * atr1
+                                    merged := true
+                                    if array.get(st, j) and not array.get(mst, last)
+                                        array.set(mst, last, true)
+                                        array.set(mnm, last, array.get(nm, j))
+                            if not merged
                                 array.push(mlv, level)
                                 array.push(mst, array.get(st, j))
                                 array.push(mnm, array.get(nm, j))

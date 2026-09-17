@@ -51,6 +51,28 @@ First version. Long-only MNQ swing engine on a 15M chart with a strict
 - **Stop wins** when a bar touches both levels — conservative, and a deliberate
   divergence from `adaptive_scanner/research/labels.py`.
 
+### Fixed before first release, from two independent review passes
+
+- **`ta.ema` was handed a `series int` length.** A user-function parameter
+  declared with a bare type name arrives as `series`, losing the input's
+  `simple` qualifier, and `ta.ema` requires `simple int`. The context functions
+  now take `simple int`, as `adaptive_scanner/asr_engine.pine` does. This was a
+  compile error, not a style point.
+- **A roll-window exit sent no alert**, so the script went flat internally and
+  stopped watching the levels while the broker position stayed open with
+  nothing left to close it.
+- **Zone candidates collapsed to the wrong price.** Walking them in priority
+  order kept the higher-priority level's own price rather than the cluster's
+  lowest, putting the zone, the invalidation and the fallback stop up to a full
+  tolerance too high.
+- **Target levels did not merge**, so a weak 1H high sitting just under a 4H
+  wall stopped vetoing the trade and the scan stepped over it to the wall.
+- **The roll window ended at 00:15 on expiry day**, because it compared a
+  timestamp against midnight instead of comparing dates.
+- Three `array.get` calls relied on `and` short-circuiting to stay in bounds,
+  one loop would have counted downward past the end of a single-element array,
+  and a float equality was used to de-duplicate the 24-hour high.
+
 ### Known limitations
 
 - Not compiled on TradingView, and not validated. 5 trades on 2.5 months of 15M

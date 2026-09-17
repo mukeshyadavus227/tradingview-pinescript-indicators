@@ -299,8 +299,10 @@ def run(bars15: Bars, p: Params | None = None) -> Result:
                     px, why = cur.tp, "TP"
                 elif in_roll_window(t[i], p.roll_block_days) and not is_last_bar_of_session(t[i]):
                     # Force-exit before the quarterly roll: a position held across
-                    # the contract change would see a basis jump the rule view
-                    # reads as a gap through SL or TP.
+                    # the contract change would see a basis jump the rules read
+                    # as a gap through SL or TP. Not on the bar closing into the
+                    # halt, where a market exit has no market to fill in; it
+                    # waits for the reopen.
                     px, why = c[i], "ROLL"
                 if why:
                     cur.exit_bar, cur.exit_time, cur.exit_price, cur.exit_reason = i, int(t[i]), float(px), why
