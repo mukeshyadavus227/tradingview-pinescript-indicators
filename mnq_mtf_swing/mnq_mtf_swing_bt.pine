@@ -1,0 +1,779 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mukeshyadavus
+
+//@version=6
+// ============================================================================
+// GENERATED FILE — DO NOT EDIT.
+// Produced by research/build_twin.py from mnq_mtf_swing.pine. Edit the
+// indicator and regenerate; `python research/build_twin.py --check` fails if
+// this file is stale. The rules below are the SAME TEXT as the indicator,
+// which is what makes a backtest of this file a backtest of that one.
+//
+// Read the Strategy Tester output against mnq_mtf_swing/README.md section
+// "What still has to be proven": a profitable equity curve on a few months of
+// 15M history is not evidence, and the number that matters is this system
+// measured against the plain-fill null on the same setups.
+// ============================================================================
+
+strategy("MNQ MTF Swing Long — BACKTEST TWIN", "MNQ-MTF-BT", overlay = true,
+     max_bars_back = 2000, max_labels_count = 200, max_lines_count = 100,
+     // ── settings that make the equity curve honest ────────────────────────
+     calc_on_every_tick = false,            // decide on confirmed bars only
+     process_orders_on_close = true,        // the entry fills at the signal bar's close
+     fill_orders_on_standard_ohlc = true,   // no Heikin-Ashi / Renko fill fiction
+     pyramiding = 0,                        // one position at a time
+     initial_capital = 25000,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.75,
+     slippage = 2)
+
+// ============================================================================
+// MNQ MTF SWING LONG  v1.0.0
+// Long-only swing engine for MNQ on a 15M chart. Strict 4H -> 1H -> 15M
+// hierarchy: nothing arms unless the 4H regime allows longs, nothing triggers
+// unless the 1H is in a controlled pullback into a real support level, and
+// nothing enters until the 15M sequence completes.
+//
+//   4H  REGIME   higher highs AND higher lows on the last two confirmed 4H
+//                pivots; rising structure (close above the slow EMA, fast above
+//                slow, slow EMA rising over the last 3 closed 4H bars); price
+//                above the most recent 4H higher low on a closing basis.
+//                "No immediate strong resistance" is enforced at the entry bar
+//                rather than as a separate gate: if the nearest STRONG level
+//                (any 4H pivot high, the provisional 4H high, or the 24h high)
+//                sits so close that the target would not reach Min R:R, the
+//                trade is skipped (TP_STRONG_WALL). Same question, asked where
+//                it has a consequence.
+//   1H  SETUP    fast EMA above slow EMA and slow EMA rising; a real pullback
+//                (24h high minus the 1H close >= 0.5 x ATR); price testing one
+//                of four support kinds, whichever is LOWEST: a rising 1H pivot
+//                low, a prior-breakout retest level, the 20 EMA, the 50 EMA.
+//                Volume contraction (SMA5 < SMA20 of 1H volume) is reported and
+//                is a hard gate only if you switch it on.
+//   15M TRIGGER  at the zone: a rejection candle (wick into the zone, close
+//                back above it, close in the upper half of the range), then a
+//                confirmed higher low, then a close above the highest high
+//                since the rejection low. Entry is at that close.
+//
+//   SL  1 tick below the 15M higher low. The 1H setup invalidation (zone floor)
+//       is the FALLBACK, used only when the higher-low stop is tighter than the
+//       noise floor of max(0.5 x ATR15, 4 ticks).
+//   TP  the nearest resistance that pays at least Min R:R, 2 ticks below the
+//       level; a STRONG level inside Min R:R skips the trade, a weak 1H level
+//       inside it is ignored. No level at all -> the 1:2 fallback.
+//
+// NON-REPAINTING
+//   Every 4H and 1H value is read from the last CLOSED higher-timeframe bar via
+//   request.security(..., expr[1], lookahead = barmerge.lookahead_on) — the
+//   idiom documented in the Pine user manual and used by asr_engine.pine [F5].
+//   The higher-timeframe bar that closes at the same instant as the current 15M
+//   bar is deliberately NOT visible until the next 15M bar. All state changes
+//   happen under barstate.isconfirmed, so a signal never appears and disappears
+//   inside a forming bar. The only intrabar logic is the SL/TP touch watch,
+//   which is what makes the exit alerts fire when the level trades rather than
+//   up to 15 minutes later.
+//
+// DEPLOYMENT (TradingView -> SignalStack -> broker)
+//   Chart:     CME_MINI:MNQ1! (or the front month), 15 minute.
+//   Alert:     one alert, condition = this script, "Any alert() function call".
+//              Leave the message box EMPTY; alert() supplies the JSON.
+//   Webhook:   your SignalStack webhook URL (the URL is the credential).
+//   Symbol:    set "Webhook symbol" to what YOUR broker expects — Tradovate
+//              MNQZ5, IBKR MNQZ25, TradeStation MNQ, TastyTrade /MNQZ5. It is
+//              NOT syminfo.ticker, and the continuous symbol MNQ1! is not a
+//              documented SignalStack symbol.
+//   Brackets:  SignalStack has no bracket/OCO field. The entry payload can only
+//              open the position; the SL and TP alerts from this script are the
+//              exits. Check "Exit action" against your broker: "close" is
+//              documented for IBKR, TradeStation, TastyTrade and E-Trade;
+//              Tradovate documents only buy/sell, where a "sell" while flat
+//              OPENS A SHORT. Test on a paper webhook before going live.
+//   Caveats:   TradingView snapshots the script when the alert is created — any
+//              edit here means re-creating the alert. Alerts below the Premium
+//              plan expire after two months.
+//
+// WHAT THIS IS NOT
+//   Not validated. The rules are the ones asked for and the code is honest
+//   about what it does, but no edge has been demonstrated: on the only sample
+//   available when it was written (2.5 months of 15M bars) it produced 5
+//   trades. The repo owner's own PHASE5/PHASE6 work found that 15M entry
+//   confirmations cost 0.16-0.17 R against a plain fill on daily-signal swings.
+//   Read mnq_mtf_swing/README.md before risking money: it states the null this
+//   must beat, the sample size needed, and the checks to run first.
+// ============================================================================
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                                INPUTS                                    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+const string GS = "Structure (4H / 1H)"
+const string GZ = "1H pullback zone"
+const string GT = "15M trigger"
+const string GR = "Risk and targets"
+const string GX = "Session and roll"
+const string GW = "Webhook (SignalStack)"
+const string GD = "Display"
+
+emaFast = input.int(20, "Fast EMA length", minval = 5, maxval = 50, group = GS,
+     tooltip = "Used on BOTH the 4H (rising-structure test) and the 1H (trend test and the 20 EMA zone candidate). The user-specified 20.")
+emaSlow = input.int(50, "Slow EMA length", minval = 20, maxval = 200, group = GS,
+     tooltip = "Used on BOTH the 4H (trend filter and its slope) and the 1H (trend test, the 50 EMA zone candidate, and the depth bound on the breakout-retest level).")
+pivHTF  = input.int(3, "4H / 1H pivot strength", minval = 2, maxval = 5, group = GS,
+     tooltip = "Bars either side of a higher-timeframe swing point. A pivot is confirmed this many bars AFTER the extreme, so with 3 the newest 4H structure is up to 12 hours old. Raising it makes structure cleaner and slower.")
+
+zoneTolATR = input.float(0.5, "Zone half-width (x ATR 1H)", minval = 0.1, maxval = 1.5, step = 0.05, group = GZ,
+     tooltip = "How close price must come to a 1H level to count as testing it, and how far below the level the setup invalidation sits. This is the one genuinely tuned parameter: sweep it 0.25 / 0.5 / 0.75 and expect a flat plateau. If performance depends on it, the rule is noise.")
+volFilter  = input.bool(false, "Require 1H volume contraction", group = GZ,
+     tooltip = "The user asked for volume contraction as PREFERRED, so it is reported on the dashboard but does not block by default. Note that TradingView and your broker's feed report different futures volume, so switching this on means the chart and another platform can disagree.")
+
+pivLTF    = input.int(2, "15M pivot strength", minval = 1, maxval = 4, group = GT,
+     tooltip = "Bars either side of the 15M higher low. 2 means the higher low is confirmed 30 minutes after it forms — that lag is the price of a non-repainting trigger.")
+stageBars = input.int(16, "Stage timeout (15M bars)", minval = 4, maxval = 64, group = GT,
+     tooltip = "Bars allowed waiting for the higher low after a rejection, and again waiting for the break after the higher low. Counted in bars, so the daily halt and weekends do not consume it.")
+
+minRR      = input.float(1.5, "Min R:R to accept a level", minval = 0.5, maxval = 5.0, step = 0.1, group = GR,
+     tooltip = "The nearest resistance paying at least this becomes the target. A STRONG level (4H pivot high, provisional 4H high, 24h high) inside this distance skips the trade entirely — that is the 'no immediate strong resistance' rule. A weak 1H level inside it is ignored and the scan continues.")
+fallbackRR = input.float(2.0, "Fallback R:R when no level qualifies", minval = 1.0, maxval = 5.0, step = 0.25, group = GR,
+     tooltip = "The user's 1:2. Used only when no candidate level sits above the entry.")
+maxRiskATR = input.float(2.0, "Max risk (x ATR 1H, 0 = off)", minval = 0.0, maxval = 5.0, step = 0.25, group = GR,
+     tooltip = "A stop wider than this is not a swing stop for this setup; the break is skipped (RISK_CAP) rather than taken with outsized risk.")
+
+useSess  = input.bool(false, "Restrict entries to a session window", group = GX,
+     tooltip = "OFF by default. MNQ trades 23 hours and this engine holds overnight, so a break at 03:00 is as valid as one at 10:00. Switching this on and using RTH suppressed every break in the sample the rules were checked against.")
+sessWin  = input.session("0830-1500", "Entry window (exchange time)", group = GX,
+     tooltip = "Only used when the restriction above is ON.")
+rollDays = input.int(3, "Block entries N days before quarterly expiry (0 = off)", minval = 0, maxval = 15, group = GX,
+     tooltip = "On a continuous chart the contract change puts a basis jump into the series that the engine would otherwise read as a gap through the stop or target. Entries stop inside this window and an open position is closed at the first bar in it.")
+
+whSymbol = input.string("MNQ", "Webhook symbol", group = GW,
+     tooltip = "Exactly what your broker expects via SignalStack: Tradovate MNQZ5, IBKR MNQZ25, TradeStation MNQ, TastyTrade /MNQZ5, Optimus XCME:MNQ.Z25. Not the chart symbol.")
+whQty    = input.int(1, "Contracts", minval = 1, maxval = 10, group = GW)
+whExit   = input.string("close", "Exit action", options = ["close", "sell", "sell_to_close"], group = GW,
+     tooltip = "'close' is documented for IBKR, TradeStation, TastyTrade and E-Trade and flattens whatever is open. Tradovate documents only buy/sell — there a 'sell' while already flat OPENS A SHORT, so verify on a paper webhook first.")
+whExtras = input.bool(false, "Add diagnostic fields to the payload", group = GW,
+     tooltip = "Adds strategy/reason/price/sl/tp/rr keys. SignalStack documents no tolerance for unknown keys, so leave this OFF for the live webhook and use it against a Test webhook.")
+
+showZone  = input.bool(true, "Shade the armed zone", group = GD)
+showSkips = input.bool(true, "Mark skipped breaks", group = GD)
+showDash  = input.bool(true, "Show dashboard", group = GD)
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                  HIGHER-TIMEFRAME CONTEXT  (non-repainting)              ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// Pivot test, evaluated inside the requested context: the bar `piv` bars back is
+// a pivot high if it is strictly above every bar to its left and at or above
+// every bar to its right. Of two equal highs the EARLIER one is the pivot, so a
+// level is never counted twice. Written out rather than using ta.pivothigh so
+// that the tie rule is explicit and the Python mirror can match it exactly.
+f_pivHigh(int piv) =>
+    float p  = high[piv]
+    bool  ok = true
+    for k = 1 to piv
+        if not (p > high[piv + k])
+            ok := false
+        if not (p >= high[piv - k])
+            ok := false
+    ok ? p : na
+
+f_pivLow(int piv) =>
+    float p  = low[piv]
+    bool  ok = true
+    for k = 1 to piv
+        if not (p < low[piv + k])
+            ok := false
+        if not (p <= low[piv - k])
+            ok := false
+    ok ? p : na
+
+// Every element is returned at offset [1]. Combined with lookahead_on at the
+// call site this is the last CONFIRMED higher-timeframe bar, identical on
+// historical and realtime bars. eS[4] is the slow EMA three closed bars before
+// the reference bar, which is the slope test.
+f_ctx4(int lenF, int lenS, int piv) =>
+    float eF  = ta.ema(close, lenF)
+    float eS  = ta.ema(close, lenS)
+    float a   = ta.atr(14)
+    float ph  = f_pivHigh(piv)
+    float pl  = f_pivLow(piv)
+    float prv = ta.highest(high, piv)
+    [close[1], eF[1], eS[1], eS[4], a[1], ph[1], pl[1], prv[1], bar_index[1]]
+
+f_ctx1(int lenF, int lenS, int piv) =>
+    float eF  = ta.ema(close, lenF)
+    float eS  = ta.ema(close, lenS)
+    float a   = ta.atr(14)
+    float hh  = ta.highest(high, 24)
+    float vF  = ta.sma(volume, 5)
+    float vS  = ta.sma(volume, 20)
+    float ph  = f_pivHigh(piv)
+    float pl  = f_pivLow(piv)
+    [close[1], eF[1], eS[1], eS[4], a[1], hh[1], vF[1], vS[1], ph[1], pl[1], bar_index[1]]
+
+[c4, ef4, es4, es4p, atr4, newPh4, newPl4, prov4, biRaw4] =
+     request.security(syminfo.tickerid, "240", f_ctx4(emaFast, emaSlow, pivHTF), lookahead = barmerge.lookahead_on)
+
+[c1, ef1, es1, es1p, atr1, h24, vFast, vSlow, newPh1, newPl1, biRaw1] =
+     request.security(syminfo.tickerid, "60", f_ctx1(emaFast, emaSlow, pivHTF), lookahead = barmerge.lookahead_on)
+
+// request.security hands numeric values back as floats; the ring bookkeeping
+// below indexes with them, so they are cast once here.
+bi4 = na(biRaw4) ? -1 : int(biRaw4)
+bi1 = na(biRaw1) ? -1 : int(biRaw1)
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                    PIVOT RINGS  (maintained on the chart)                ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// The rings live in the CHART context, not inside the request.security call, so
+// a forming higher-timeframe bar can never push a half-formed pivot. A new
+// higher-timeframe bar is recognised by its returned bar index changing, and
+// each one is processed exactly once, under barstate.isconfirmed.
+const int RING = 8
+
+var array<float> ph4P = array.new<float>()
+var array<float> pl4P = array.new<float>()
+var array<float> ph1P = array.new<float>()
+var array<int>   ph1I = array.new<int>()
+var array<bool>  ph1B = array.new<bool>()
+var array<float> pl1P = array.new<float>()
+var int lastBi4 = -1
+var int lastBi1 = -1
+
+f_push(array<float> arr, float v) =>
+    array.unshift(arr, v)
+    if array.size(arr) > RING
+        array.pop(arr)
+    true
+
+f_get(array<float> arr, int i) =>
+    array.size(arr) > i ? array.get(arr, i) : na
+
+if barstate.isconfirmed and bi4 >= 0 and bi4 != lastBi4
+    lastBi4 := bi4
+    if not na(newPh4)
+        f_push(ph4P, newPh4)
+    if not na(newPl4)
+        f_push(pl4P, newPl4)
+
+if barstate.isconfirmed and bi1 >= 0 and bi1 != lastBi1
+    lastBi1 := bi1
+    if not na(newPh1)
+        array.unshift(ph1P, newPh1)
+        array.unshift(ph1I, bi1 - pivHTF)
+        array.unshift(ph1B, false)
+        if array.size(ph1P) > RING
+            array.pop(ph1P)
+            array.pop(ph1I)
+            array.pop(ph1B)
+    if not na(newPl1)
+        f_push(pl1P, newPl1)
+    // A level counts as "broken" once a later 1H close clears it by the zone
+    // tolerance. Those are the only levels a retest can happen at.
+    float tol1 = zoneTolATR * nz(atr1)
+    if array.size(ph1P) > 0 and tol1 > 0 and not na(c1)
+        for j = 0 to array.size(ph1P) - 1
+            if not array.get(ph1B, j) and bi1 > array.get(ph1I, j) + pivHTF and c1 > array.get(ph1P, j) + tol1
+                array.set(ph1B, j, true)
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                            4H MARKET REGIME                              ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+ph4_0 = f_get(ph4P, 0)
+ph4_1 = f_get(ph4P, 1)
+pl4_0 = f_get(pl4P, 0)
+pl4_1 = f_get(pl4P, 1)
+
+R1 = not na(ph4_0) and not na(ph4_1) and not na(pl4_0) and not na(pl4_1) and ph4_0 > ph4_1 and pl4_0 > pl4_1
+R2 = not na(c4) and not na(es4) and not na(es4p) and c4 > es4 and ef4 > es4 and es4 > es4p
+R3 = not na(pl4_0) and not na(c4) and c4 > pl4_0
+regime4H = R1 and R2 and R3
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                     1H SETUP AND ZONE CANDIDATES                         ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+tol = zoneTolATR * nz(atr1)
+
+S1 = not na(ef1) and not na(es1) and not na(es1p) and ef1 > es1 and es1 > es1p
+S2 = not na(h24) and not na(atr1) and not na(c1) and (h24 - c1) >= 0.5 * atr1
+S3 = not na(vFast) and not na(vSlow) and vFast < vSlow
+ctx1H = S1 and S2 and (S3 or not volFilter)
+
+pl1_0 = f_get(pl1P, 0)
+pl1_1 = f_get(pl1P, 1)
+risingPL = not na(pl1_0) and not na(pl1_1) and pl1_0 > pl1_1 ? pl1_0 : na
+
+// Prior breakout-retest level: the most recent 1H pivot high that price has
+// since closed above, still below the current 1H close, and not so far under
+// the slow EMA that calling the move a "controlled pullback" stops meaning
+// anything.
+float brkLvl = na
+if array.size(ph1P) > 0 and not na(c1) and not na(es1)
+    for j = 0 to array.size(ph1P) - 1
+        float lv = array.get(ph1P, j)
+        if na(brkLvl) and array.get(ph1B, j) and lv < c1 and lv >= es1 - 2 * tol
+            brkLvl := lv
+
+// The zone is tested on the 15M bar against the 1H level, so a rejection that
+// happens inside the still-forming 1H bar is not missed.
+f_touch(float lvl) =>
+    not na(lvl) and low <= lvl + tol and close >= lvl - tol
+
+// The LOWEST qualifying candidate wins because it gives the most conservative
+// invalidation. Candidates are evaluated in priority order and only displaced
+// by a level lower than the incumbent by more than the tolerance, so two levels
+// that coincide keep the higher-priority kind.
+float bestLvl = na
+int bestKind = -1
+if f_touch(risingPL)
+    bestLvl := risingPL
+    bestKind := 0
+if f_touch(brkLvl) and (na(bestLvl) or brkLvl < bestLvl - tol)
+    bestLvl := brkLvl
+    bestKind := 1
+if f_touch(ef1) and (na(bestLvl) or ef1 < bestLvl - tol)
+    bestLvl := ef1
+    bestKind := 2
+if f_touch(es1) and (na(bestLvl) or es1 < bestLvl - tol)
+    bestLvl := es1
+    bestKind := 3
+
+kindName(int k) => k == 0 ? "PL" : k == 1 ? "BRK" : k == 2 ? "EMA20" : k == 3 ? "EMA50" : "-"
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                       CHART-TIMEFRAME CALCULATIONS                       ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+atr15 = ta.atr(14)
+
+f_pl15(int piv) =>
+    float p  = low[piv]
+    bool  ok = true
+    for k = 1 to piv
+        if not (p < low[piv + k])
+            ok := false
+        if not (p <= low[piv - k])
+            ok := false
+    ok ? p : na
+
+newPl15 = f_pl15(pivLTF)
+
+// Highest high from `fromOff` bars back up to `toOff` bars back, inclusive.
+f_highestBetween(int fromOff, int toOff) =>
+    float mx = na
+    if toOff >= fromOff
+        for o = fromOff to toOff
+            mx := na(mx) ? high[o] : math.max(mx, high[o])
+    mx
+
+// Calendar helpers, computed from the bar time alone so the rule is identical
+// anywhere: the quarterly expiry is the third Friday of Mar/Jun/Sep/Dec.
+f_thirdFriday(int y, int m) =>
+    int firstDow = dayofweek(timestamp(y, m, 1, 0, 0))
+    int offset   = (6 - firstDow + 7) % 7
+    timestamp(y, m, 1 + offset + 14, 0, 0)
+
+f_nextExpiry() =>
+    int y  = year(time)
+    int m  = month(time)
+    int qm = m <= 3 ? 3 : m <= 6 ? 6 : m <= 9 ? 9 : 12
+    int e  = f_thirdFriday(y, qm)
+    if e < time
+        e := qm == 12 ? f_thirdFriday(y + 1, 3) : f_thirdFriday(y, qm + 3)
+    e
+
+inRoll     = rollDays > 0 and (f_nextExpiry() - time) <= rollDays * 86400000
+lastBarSes = hour(time, "America/Chicago") == 15 and minute(time, "America/Chicago") == 45
+inWindow   = not useSess or not na(time(timeframe.period, sessWin))
+weekendGap = bar_index > 0 and (time - time[1]) > 120 * 60 * 1000
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                         15M TRIGGER STATE MACHINE                        ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+const int ST_IDLE  = 0
+const int ST_ZONE  = 1
+const int ST_REJ   = 2
+const int ST_HL    = 3
+const int ST_TRADE = 4
+
+var int    state    = ST_IDLE
+var float  zStar    = na
+var float  tolStar  = na
+var float  zInv     = na
+var int    kindStar = -1
+var int    armBar   = -1
+var float  rl       = na
+var int    rlBar    = -1
+var float  hl       = na
+var int    hlBar    = -1
+var float  sh       = na
+var int    stageBar = -1
+var float  entryPx  = na
+var float  slPx     = na
+var float  tpPx     = na
+var float  riskPts  = na
+var float  rrOut    = na
+var int    entryBar = -1
+var string slSrc    = ""
+var string tpSrc    = ""
+var int    lastEvBar = -1
+var int    guardBi1  = -1
+var string blockTxt  = "WARMUP"
+var string skipTxt   = ""
+
+warmOk = not na(atr15) and not na(atr1) and not na(atr4) and not na(es4p) and not na(es1p) and
+     not na(h24) and not na(vSlow) and array.size(ph4P) >= 2 and array.size(pl4P) >= 2 and
+     array.size(pl1P) >= 2 and bar_index >= 100
+
+// ---- exit watch ----------------------------------------------------------
+// Evaluated on EVERY tick from the values committed on the previous bar, and
+// placed BEFORE the state block that can change them. This is what makes an SL
+// or TP alert fire when the level actually trades instead of at bar close, and
+// it is why the alert cannot be swallowed by the state machine resetting on the
+// same tick.
+watching = state == ST_TRADE and bar_index > entryBar and not na(slPx) and not na(tpPx)
+slTouch  = watching and (open <= slPx or low <= slPx)
+tpTouch  = watching and not slTouch and (open >= tpPx or high >= tpPx)
+
+bool entryFired = false
+bool skipFired  = false
+bool exitFired  = false
+
+if barstate.isconfirmed
+    if state == ST_TRADE
+        // The entry bar itself is never an exit bar.
+        if bar_index > entryBar
+            string why = ""
+            if open <= slPx
+                why := "SL_GAP"
+            else if open >= tpPx
+                why := "TP_GAP"
+            else if low <= slPx
+                why := "SL"          // stop wins when both levels are touched
+            else if high >= tpPx
+                why := "TP"
+            else if inRoll and not lastBarSes
+                why := "ROLL"
+            if why != ""
+                exitFired := true
+                state     := ST_IDLE
+                lastEvBar := bar_index
+                guardBi1  := bi1
+    else if not warmOk
+        state := ST_IDLE
+    else
+        // ---------- global resets -----------------------------------------
+        if state == ST_ZONE or state == ST_REJ or state == ST_HL
+            string rs = not regime4H ? "4H_LOST" : not S1 ? "1H_TREND_LOST" :
+                 close < zInv ? "INVALIDATED" : weekendGap ? "SESSION_GAP" : ""
+            if rs != ""
+                state     := ST_IDLE
+                lastEvBar := bar_index
+                if rs == "INVALIDATED"
+                    guardBi1 := bi1
+
+        // ---------- arm ----------------------------------------------------
+        if state == ST_IDLE and regime4H and ctx1H and bar_index != lastEvBar and bi1 != guardBi1 and not na(bestLvl)
+            zStar    := bestLvl
+            kindStar := bestKind
+            tolStar  := tol
+            zInv     := bestLvl - tol
+            armBar   := bar_index
+            rl       := low
+            rlBar    := bar_index
+            state    := ST_ZONE
+
+        // ---------- higher low from a confirmed 15M pivot -------------------
+        if not na(newPl15)
+            int p = bar_index - pivLTF
+            if state == ST_REJ and p > rlBar and newPl15 > rl and newPl15 >= zInv
+                hl       := newPl15
+                hlBar    := p
+                sh       := f_highestBetween(pivLTF + 1, bar_index - rlBar)
+                state    := ST_HL
+                stageBar := bar_index
+            else if state == ST_HL and p > hlBar and newPl15 > hl
+                hl    := newPl15
+                hlBar := p
+                sh    := math.max(nz(sh, high), nz(f_highestBetween(pivLTF + 1, bar_index - rlBar), high))
+
+        // ---------- at the zone --------------------------------------------
+        if state == ST_ZONE
+            if low < rl
+                rl    := low
+                rlBar := bar_index
+            bool rej = low <= zStar + tolStar and close > zStar and high > low and (close - low) >= 0.5 * (high - low)
+            if close > zStar + 2 * tolStar
+                state     := ST_IDLE          // price left the zone upward without rejecting
+                lastEvBar := bar_index
+            else if bar_index - armBar > stageBars
+                state     := ST_IDLE
+                lastEvBar := bar_index
+            else if rej
+                state    := ST_REJ
+                stageBar := bar_index
+
+        // ---------- undercuts ----------------------------------------------
+        if state == ST_REJ or state == ST_HL
+            if low < rl
+                rl    := low
+                rlBar := bar_index
+                // A deeper test of the same level is the canonical second
+                // attempt, so it re-rejects in place rather than killing the
+                // setup; without a rejection candle it drops back to the zone.
+                bool rej2 = low <= zStar + tolStar and close > zStar and high > low and (close - low) >= 0.5 * (high - low)
+                state := rej2 ? ST_REJ : ST_ZONE
+                if rej2
+                    stageBar := bar_index
+            else if state == ST_HL and low < hl
+                state    := ST_REJ
+                stageBar := bar_index
+
+        if (state == ST_REJ or state == ST_HL) and bar_index - stageBar > stageBars
+            state     := ST_IDLE
+            lastEvBar := bar_index
+            guardBi1  := bi1
+
+        // ---------- break and entry gate -----------------------------------
+        if state == ST_HL
+            if not na(sh) and close > sh
+                float ent  = math.round_to_mintick(close)
+                float flr  = math.max(0.5 * atr15, 4 * syminfo.mintick)
+                float sl   = math.round_to_mintick(hl) - syminfo.mintick
+                float rsk  = ent - sl
+                string src = "HL"
+                string rsn = ""
+                if rsk < flr
+                    float sl2 = math.round_to_mintick(zInv) - syminfo.mintick
+                    if ent - sl2 >= flr
+                        sl  := sl2
+                        rsk := ent - sl2
+                        src := "1H-INV"
+                    else
+                        rsn := "RISK_FLOOR"
+                if rsn == "" and maxRiskATR > 0 and rsk > maxRiskATR * atr1
+                    rsn := "RISK_CAP"
+
+                float tp = na
+                string tsrc = ""
+                if rsn == ""
+                    array<float>  lv = array.new<float>()
+                    array<bool>   st = array.new<bool>()
+                    array<string> nm = array.new<string>()
+                    if array.size(ph4P) > 0
+                        for j = 0 to array.size(ph4P) - 1
+                            array.push(lv, array.get(ph4P, j))
+                            array.push(st, true)
+                            array.push(nm, "4H-PH")
+                    if not na(h24)
+                        array.push(lv, h24)
+                        array.push(st, true)
+                        array.push(nm, "1H-HIGH")
+                    if not na(prov4) and not na(c4) and prov4 > c4
+                        array.push(lv, prov4)
+                        array.push(st, true)
+                        array.push(nm, "4H-PROV")
+                    if array.size(ph1P) > 0
+                        for j = 0 to array.size(ph1P) - 1
+                            if array.get(ph1P, j) != h24
+                                array.push(lv, array.get(ph1P, j))
+                                array.push(st, false)
+                                array.push(nm, "1H-PH")
+                    // insertion sort, ascending by level
+                    if array.size(lv) > 1
+                        for a = 1 to array.size(lv) - 1
+                            float  kv = array.get(lv, a)
+                            bool   ks = array.get(st, a)
+                            string kn = array.get(nm, a)
+                            int    b  = a - 1
+                            while b >= 0 and array.get(lv, b) > kv
+                                array.set(lv, b + 1, array.get(lv, b))
+                                array.set(st, b + 1, array.get(st, b))
+                                array.set(nm, b + 1, array.get(nm, b))
+                                b -= 1
+                            array.set(lv, b + 1, kv)
+                            array.set(st, b + 1, ks)
+                            array.set(nm, b + 1, kn)
+                    float minLv = ent + 3 * syminfo.mintick
+                    if array.size(lv) > 0
+                        for j = 0 to array.size(lv) - 1
+                            float level = array.get(lv, j)
+                            if na(tp) and rsn == "" and level > minLv
+                                float cand = math.round_to_mintick(level) - 2 * syminfo.mintick
+                                float rr   = (cand - ent) / rsk
+                                if rr >= minRR
+                                    tp   := cand
+                                    tsrc := array.get(nm, j)
+                                else if array.get(st, j)
+                                    rsn := "TP_STRONG_WALL"
+                    if rsn == "" and na(tp)
+                        tp   := math.round_to_mintick(ent + fallbackRR * rsk)
+                        tsrc := "RR"
+                    if rsn == "" and not na(tp) and tp < ent + 2 * syminfo.mintick
+                        rsn := "GEOMETRY"
+
+                // A deferral does not end the setup; the stage timer keeps
+                // running and the reference high ratchets.
+                bool defer = lastBarSes or not inWindow or inRoll
+                if defer
+                    sh := math.max(sh, high)
+                else if rsn != ""
+                    skipFired := true
+                    skipTxt   := rsn
+                    state     := ST_IDLE
+                    lastEvBar := bar_index
+                    guardBi1  := bi1
+                else
+                    entryPx    := ent
+                    slPx       := sl
+                    tpPx       := tp
+                    riskPts    := rsk
+                    rrOut      := (tp - ent) / rsk
+                    slSrc      := src
+                    tpSrc      := tsrc
+                    entryBar   := bar_index
+                    state      := ST_TRADE
+                    entryFired := true
+            else
+                sh := math.max(nz(sh, high), high)
+
+    blockTxt := not warmOk ? "WARMUP" : state == ST_TRADE ? "IN TRADE" :
+         not R1 ? "4H: no HH/HL" : not R2 ? "4H: not rising" : not R3 ? "4H: below support" :
+         not S1 ? "1H: trend" : not S2 ? "1H: no pullback" : (volFilter and not S3) ? "1H: volume" :
+         state == ST_ZONE ? "15M: wait rejection" : state == ST_REJ ? "15M: wait higher low" :
+         state == ST_HL ? "15M: wait break" : bi1 == guardBi1 ? "re-arm guard" :
+         na(bestLvl) ? "1H: not at a zone" : "READY"
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                      ALERTS  (SignalStack payloads)                      ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// SignalStack payloads are flat JSON with snake_case keys, and "class":"future"
+// is required for futures. There is NO bracket or OCO field in the schema, so
+// the SL and TP alerts below ARE the exits. Order type is inferred from which
+// price keys are present — none here, so these are market orders.
+f2(float v) => str.tostring(v, "0.##")
+
+f_payload(string action, string reason) =>
+    string base = '{"symbol":"' + whSymbol + '","action":"' + action + '","quantity":' +
+         str.tostring(whQty) + ',"class":"future"'
+    string extra = whExtras ?
+         ',"strategy":"MNQ_MTF_v1","reason":"' + reason + '","price":' + f2(close) +
+         ',"sl":' + f2(nz(slPx)) + ',"tp":' + f2(nz(tpPx)) + ',"rr":' + f2(nz(rrOut)) : ""
+    base + extra + '}'
+
+if entryFired
+    alert(f_payload("buy", "ENTRY"), alert.freq_once_per_bar_close)
+if slTouch
+    alert(f_payload(whExit, "SL"), alert.freq_once_per_bar)
+if tpTouch
+    alert(f_payload(whExit, "TP"), alert.freq_once_per_bar)
+
+// Plain-text conditions for a second, non-SignalStack notification channel.
+alertcondition(entryFired, "Entry (diagnostic)", "MNQ MTF long entry {{ticker}} @ {{close}}")
+alertcondition(slTouch, "SL hit (diagnostic)", "MNQ MTF stop hit {{ticker}} @ {{close}}")
+alertcondition(tpTouch, "TP hit (diagnostic)", "MNQ MTF target hit {{ticker}} @ {{close}}")
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                             VISUALISATION                                ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+inTrade = state == ST_TRADE
+inSetup = state == ST_ZONE or state == ST_REJ or state == ST_HL
+
+plotshape(entryFired, "Entry", shape.triangleup, location.belowbar, color.new(color.green, 0),
+     text = "Entry", textcolor = color.new(color.white, 0), size = size.small)
+plotshape(showSkips and skipFired, "Skipped break", shape.triangleup, location.belowbar,
+     color.new(color.gray, 40), text = "skip", textcolor = color.new(color.gray, 0), size = size.tiny)
+plotshape(exitFired, "Exit", shape.xcross, location.abovebar, color.new(color.orange, 0), size = size.tiny)
+
+plot(inTrade ? slPx : na, "SL", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(inTrade ? tpPx : na, "TP", color = color.new(color.blue, 0), style = plot.style_linebr, linewidth = 2)
+plot(inTrade ? entryPx : na, "Entry price", color = color.new(color.white, 40), style = plot.style_linebr, linewidth = 1)
+
+zoneTop = plot(showZone and inSetup ? zStar + tolStar : na, "Zone top",
+     color = color.new(color.orange, 70), style = plot.style_linebr)
+zoneBot = plot(showZone and inSetup ? zInv : na, "Zone floor",
+     color = color.new(color.orange, 70), style = plot.style_linebr)
+fill(zoneTop, zoneBot, color = color.new(color.orange, 92), title = "Zone")
+
+if entryFired
+    label.new(bar_index, low, "Entry " + f2(entryPx) + "  [" + kindName(kindStar) + "]" +
+         "\nSL " + f2(slPx) + " (" + slSrc + ")" +
+         "\nTP " + f2(tpPx) + " (" + tpSrc + " " + f2(rrOut) + "R)",
+         yloc = yloc.belowbar, style = label.style_label_up,
+         color = color.new(color.green, 20), textcolor = color.white, size = size.small)
+
+if showSkips and skipFired
+    label.new(bar_index, high, skipTxt, yloc = yloc.abovebar, style = label.style_label_down,
+         color = color.new(color.gray, 40), textcolor = color.white, size = size.tiny)
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                              DASHBOARD                                   ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// The BLOCK row is the point of this table: when nothing is firing it names the
+// single gate responsible, which is the question you actually have when staring
+// at a quiet chart.
+var table tbl = table.new(position.top_right, 2, 8, border_color = color.gray, border_width = 1,
+     frame_color = color.gray, frame_width = 2)
+
+f_row(int r, string a, string b, color cb) =>
+    table.cell(tbl, 0, r, a, text_color = color.white, text_size = size.small, bgcolor = color.new(color.navy, 20))
+    table.cell(tbl, 1, r, b, text_color = cb, text_size = size.small)
+    true
+
+if barstate.islast and showDash
+    color okC = color.new(color.green, 0)
+    color noC = color.new(color.gray, 0)
+    f_row(0, "MNQ MTF", timeframe.period + "  v1.0.0", color.new(color.white, 20))
+    f_row(1, "4H regime", (R1 ? "HH/HL " : "— ") + (R2 ? "rising " : "— ") + (R3 ? "support" : "—"),
+         regime4H ? okC : noC)
+    f_row(2, "1H setup", (S1 ? "trend " : "— ") + (S2 ? "pullback " : "— ") + (S3 ? "vol down" : "vol flat"),
+         ctx1H ? okC : noC)
+    f_row(3, "Zone", na(bestLvl) ? "none" : kindName(bestKind) + " " + f2(bestLvl), na(bestLvl) ? noC : okC)
+    f_row(4, "15M state", state == ST_IDLE ? "idle" : state == ST_ZONE ? "at zone" :
+         state == ST_REJ ? "rejected, wait higher low" : state == ST_HL ? "higher low, break " + f2(sh) : "IN TRADE",
+         state >= ST_REJ ? okC : noC)
+    f_row(5, "Risk", inTrade ? "SL " + f2(slPx) + " (" + slSrc + ")  " + f2(riskPts) + " pts" : "—",
+         inTrade ? color.new(color.red, 0) : noC)
+    f_row(6, "Target", inTrade ? "TP " + f2(tpPx) + " (" + tpSrc + ")  " + f2(rrOut) + "R" : "—",
+         inTrade ? color.new(color.blue, 0) : noC)
+    f_row(7, "BLOCK", blockTxt, blockTxt == "READY" ? okC : color.new(color.orange, 0))
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║            STRATEGY EXECUTION  (twin only — appended by build_twin.py)   ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+// The rules above decide the levels; this block only places the orders that
+// realise them, so the twin's fills follow the same geometry the indicator
+// draws and the webhook sends.
+//
+// The bracket is issued on the ENTRY bar as well as on every bar in the
+// position. Under process_orders_on_close the entry fills at this bar's close
+// AFTER the script has run, so strategy.position_size is still 0 here; an exit
+// issued only once position_size > 0 would not exist during the next bar's
+// intrabar path, while the indicator treats SL and TP as live from the bar
+// after entry. Exit orders bound to a pending entry wait for its fill, so
+// issuing them now makes them live exactly when the rules say they are.
+//
+// TradingView's broker emulator resolves a bar that touches both levels by its
+// own path assumption, while the indicator and the Python mirror resolve it as
+// STOP WINS. That is the one known place where the twin can print a better
+// trade than the rules allow, and it biases the twin OPTIMISTICALLY. Count how
+// many trades exit on a bar whose range spans both levels before trusting the
+// headline number.
+if entryFired
+    strategy.entry("L", strategy.long, qty = 1, comment = tpSrc)
+
+if state == ST_TRADE and (entryFired or strategy.position_size > 0)
+    strategy.exit("L-x", "L", stop = slPx, limit = tpPx, comment_loss = "SL", comment_profit = "TP")
+
+// The rules exited (roll window, or an exit the emulator did not take) but the
+// emulator still holds the position: flatten it and tag it so the difference is
+// visible in the trade list rather than hidden in the equity curve.
+if strategy.position_size > 0 and state != ST_TRADE
+    strategy.close_all(comment = "RESYNC")

@@ -69,18 +69,52 @@ def is_continuation(line: str) -> bool:
     return indent > 0 and indent % 4 != 0
 
 
+def depth_delta(line: str) -> int:
+    """Net change in ( [ { depth for one line, ignoring strings and comments."""
+    d = 0
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        else:
+            if line.startswith("//", i):
+                break
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch in OPEN:
+                d += 1
+            elif ch in CLOSE:
+                d -= 1
+        i += 1
+    return d
+
+
 def logical_lines(lines):
-    """Yield (start_lineno, [physical lines]) groups."""
+    """Yield (start_lineno, [physical lines]) groups.
+
+    A line continues the previous one when a delimiter is still open (Pine
+    allows comment-only lines inside a multi-line call) or when its indentation
+    is not a multiple of 4, which is how Pine itself marks a continuation.
+    """
     group = []
     start = 0
+    depth = 0
     for n, line in enumerate(lines, 1):
-        if is_continuation(line) and group:
+        if group and (depth > 0 or is_continuation(line)):
             group.append(line)
+            depth += depth_delta(line)
             continue
         if group:
             yield start, group
         group = [line]
         start = n
+        depth = depth_delta(line)
     if group:
         yield start, group
 
