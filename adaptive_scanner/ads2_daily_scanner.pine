@@ -71,6 +71,11 @@ indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
 //       "Days to Earnings" = exact, "Days to Earnings Est" = cadence estimate.
 //     - Sector relative strength: syminfo.sector → SPDR sector ETF, RS 3M vs the
 //       sector and the sector's own 50/200 trend. Columns + dashboard, no gate.
+//       CHART ONLY: the Screener does not supply syminfo.sector either (verified
+//       on version 8: Data OK bit 64 clear, Sector RS blank on every row), so
+//       inside the Screener the sector falls back to the benchmark and the
+//       column prints blank. Breadth, the earnings estimate and the quarterly
+//       acceleration columns DO populate in the Screener.
 //     - Breadth: INDEX:S5FI / S5TH (% of S&P 500 above 50D / 200D). Columns +
 //       dashboard, no gate. Mkt Regime keeps the CLS v3 encoding.
 //     - Quarterly acceleration: EPS / revenue FQ series → YoY growth of the last
@@ -291,6 +296,8 @@ accelOk  = nz(epsAccel) >= 1.0
 // ── Sector ETF: RS vs the symbol's own sector (request #7; v2.2) ───────────
 // TradingView sectors (syminfo.sector) mapped to the SPDR that holds them.
 // REITs sit in "Finance" here; Industrial Services holds oilfield services.
+// CHART ONLY: the Pine Screener does not supply syminfo.sector (verified
+// 2026-10-24), so there the switch falls to the benchmark and secOk is false.
 secSym = switch syminfo.sector
     "Technology Services"    => "AMEX:XLK"
     "Electronic Technology"  => "AMEX:XLK"
