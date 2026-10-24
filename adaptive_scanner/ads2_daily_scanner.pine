@@ -188,8 +188,6 @@ showPreview   = input.bool(true, "Chart: dashed preview while today's bar is sti
 showBlocked   = input.bool(true, "Chart: grey levels for a setup blocked only by the earnings blackout", display = display.none, group = "Display",
      tooltip = "The Pine Screener cannot read earnings dates, so its Horizon > 0 rows include names the chart blocks on the blackout. Those levels are drawn in grey with the reason, so every Screener row has a visible explanation on the chart. Grey = screener row, coloured = real deploy.")
 showShapes    = input.bool(true, "Chart: deploy markers", display = display.none, group = "Display")
-showLaneLabel = input.bool(false, "Chart: lane letter on markers (S / P / G)", display = display.none, group = "Display",
-     tooltip = "OFF = clean triangles coloured by lane (green swing, teal positional, purple growth).")
 showDash      = input.bool(true, "Chart: dashboard", display = display.none, group = "Display")
 dashPos       = input.string("top_right", "Chart: dashboard position", display = display.none, options = ["top_right", "top_left", "middle_right", "middle_left", "bottom_right", "bottom_left"], group = "Display",
      tooltip = "Move it when another indicator's table (v1.0, CLS) already sits top-right.")
@@ -905,12 +903,12 @@ plot(showLines ? sma200 : na, "SMA 200", color = color.new(color.gray, 30),   di
 
 // One marker per bar, the Horizon lane only; never on the forming bar in closed-bar mode.
 mk = showShapes and horizon > 0 and not (useClosedOnly and forming)
-plotshape(mk and horizon == 1 and not showLaneLabel, "Swing deploy", shape.triangleup, location.belowbar, color.green, size = size.small, display = display.pane)
-plotshape(mk and horizon == 2 and not showLaneLabel, "Positional deploy", shape.triangleup, location.belowbar, color.teal, size = size.small, display = display.pane)
-plotshape(mk and horizon == 3 and not showLaneLabel, "Growth deploy", shape.triangleup, location.belowbar, color.purple, size = size.small, display = display.pane)
-plotshape(mk and horizon == 1 and showLaneLabel, "Swing deploy (S)", shape.labelup, location.belowbar, color.green, text = "S", textcolor = color.white, size = size.small, display = display.pane)
-plotshape(mk and horizon == 2 and showLaneLabel, "Positional deploy (P)", shape.labelup, location.belowbar, color.teal, text = "P", textcolor = color.white, size = size.small, display = display.pane)
-plotshape(mk and horizon == 3 and showLaneLabel, "Growth deploy (G)", shape.labelup, location.belowbar, color.purple, text = "G", textcolor = color.white, size = size.small, display = display.pane)
+// Pine counts plot(), plotshape() and alertcondition() against one 64-output
+// limit: 52 columns + 3 SMAs + 3 markers + 5 filters = 63. The S/P/G letter
+// variant of the markers was dropped in v2.2 to stay under it.
+plotshape(mk and horizon == 1, "Swing deploy", shape.triangleup, location.belowbar, color.green, size = size.small, display = display.pane)
+plotshape(mk and horizon == 2, "Positional deploy", shape.triangleup, location.belowbar, color.teal, size = size.small, display = display.pane)
+plotshape(mk and horizon == 3, "Growth deploy", shape.triangleup, location.belowbar, color.purple, size = size.small, display = display.pane)
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ DASHBOARD (v1.0 layout: strategy rows → winner → risk → position → context)║
