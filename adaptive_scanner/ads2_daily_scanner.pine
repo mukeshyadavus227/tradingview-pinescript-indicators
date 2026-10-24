@@ -5,7 +5,7 @@
 indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
 
 // ============================================================================
-// ADAPTIVE DAILY SCANNER  v2.1.1  (2026-10-23)  — Pine Screener edition, 1D close
+// ADAPTIVE DAILY SCANNER  v2.2.0  (2026-10-24)  — Pine Screener edition, 1D close
 //
 // LINEAGE
 //   Portfolio Scanner v5 [CODEX] → Adaptive Swing Scanner v1.0 (4H, 2026-05-16)
@@ -61,9 +61,26 @@ indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
 //     block (DHI, 2026-10-23). The chart now draws that setup's Entry / SL / TP
 //     in grey, dashed, labelled "NO DEPLOY: EARNINGS nd", and the WINNER row
 //     says why it waits. Grey = the Screener row; coloured = a real deploy.
+//   • v2.2.0 (after TradingView raised the Screener request limit 5 → 40 on
+//     2026-10-23; probe script "ADS2 Probe" run in the Screener 2026-10-24):
+//     - earnings.future_time is STILL not supplied in the Screener, not even
+//       through request.security(). request.earnings() IS. So the next report is
+//       now ESTIMATED from the reporting cadence (last report bar + the interval
+//       that followed the same report a year earlier), with a cushion, and the
+//       blackout uses the estimate when the exact date is missing. Columns:
+//       "Days to Earnings" = exact, "Days to Earnings Est" = cadence estimate.
+//     - Sector relative strength: syminfo.sector → SPDR sector ETF, RS 3M vs the
+//       sector and the sector's own 50/200 trend. Columns + dashboard, no gate.
+//     - Breadth: INDEX:S5FI / S5TH (% of S&P 500 above 50D / 200D). Columns +
+//       dashboard, no gate. Mkt Regime keeps the CLS v3 encoding.
+//     - Quarterly acceleration: EPS / revenue FQ series → YoY growth of the last
+//       three quarters, acceleration code (0-2) and the CAN SLIM "C" count
+//       (quarters ≥ 25%). Columns + dashboard; optional growth gate, OFF.
+//     Nothing new gates a deploy by default. Validate first, then gate.
 //
 // PINE SCREENER CONSTRAINTS HONOURED
-//   • request.*() calls: weekly tuple (1) + benchmark (1) + financials (2) = 4 of 5.
+//   • request.*() calls: weekly tuple (1) + benchmark (1) + financials 1Y (2) +
+//     earnings (2) + sector ETF (1) + breadth (2) + financials FQ (2) = 11 of 40.
 //   • 500-bar history: deepest lookback 252 + 14 (ATR percentile) < 500.
 //   • input.symbol / input.timeframe are ignored by the screener → input.string.
 //   • The first 10 plots are the default columns; plot order = decision order.
@@ -77,6 +94,7 @@ indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
 //   Strategy    1 MR (S1) · 3 MOM (S3) · 4 MTF (S4) · 5 PB50 · 6 RECLAIM50 · 7 BASE100
 //   Lanes bits  1 swing deploy · 2 positional deploy · 4 growth deploy
 //   Data OK     1 warm-up done · 2 benchmark ok · 4 fundamentals ok · 8 earnings date ok · 16 chart is 1D
+//               · 32 earnings date estimated from cadence · 64 sector ETF ok · 128 breadth ok
 //   Regime      0 NEUTRAL · 1 MEAN_REV · 2 BREAKOUT · 3 MOMENTUM · 4 TRENDING (metadata only)
 // ============================================================================
 
@@ -91,6 +109,9 @@ minAdvM       = input.float(5.0, "Min 20-day avg dollar volume ($M)", display = 
 minPrice      = input.float(5.0, "Min price", display = display.none, minval = 0.0, step = 0.5, group = "Master")
 minRR         = input.float(1.5, "Min R:R to deploy (swing & positional)", display = display.none, minval = 0.5, maxval = 5.0, step = 0.1, group = "Master",
      tooltip = "ASR default 1.5: catches degenerate geometry only, never vetoes a designed ratio.")
+earnEstOn     = input.bool(true, "Earnings: estimate the next report from the reporting cadence when the date is unavailable", display = display.none, group = "Master",
+     tooltip = "The Pine Screener never supplies earnings.future_time (verified again 2026-10-24, request wrappers included) but it does supply request.earnings(). The next report is projected as last report bar + the interval that followed the same report one year earlier. Error is a few days; the cushion below is added before the blackout test. An exact date always wins.")
+earnEstCushion = input.int(3, "Earnings: cushion days added to the estimate", display = display.none, minval = 0, maxval = 10, group = "Master")
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ LANE GATES                                                               ║
@@ -100,7 +121,7 @@ sw_s1Gate     = input.float(18.0, "SWING · S1 trend-component gate", display = 
 sw_s3Gate     = input.float(70.0, "SWING · S3 score gate (rate limiter)", display = display.none, minval = 0.0, maxval = 95.0, step = 1.0, group = "Swing lane")
 sw_s4Gate     = input.float(75.0, "SWING · S4 score gate (validated 70-75)", display = display.none, minval = 0.0, maxval = 95.0, step = 1.0, group = "Swing lane")
 sw_earnDays   = input.int(7, "SWING · earnings blackout (days, 0 = off)", display = display.none, minval = 0, maxval = 30, group = "Swing lane",
-     tooltip = "Block a swing deploy when the next earnings report is within N calendar days. Uses earnings.future_time; na dates never block.")
+     tooltip = "Block a swing deploy when the next earnings report is within N calendar days. Exact date on the chart; inside the Screener the cadence estimate (plus its cushion) is used; no date at all never blocks.")
 sw_mktMin     = input.int(0, "SWING · min benchmark regime (0-2)", display = display.none, minval = 0, maxval = 2, group = "Swing lane",
      tooltip = "0 = no market gate (mean reversion does not want one). 1 = benchmark above its 200D. 2 = above 200D with rising 50D.")
 sw_cool       = input.int(10, "SWING · cooldown bars after a deploy (0 = off)", display = display.none, minval = 0, maxval = 60, group = "Swing lane",
@@ -128,6 +149,8 @@ gr_earnDays   = input.int(0, "GROWTH · earnings blackout (days, 0 = off)", disp
 gr_mktMin     = input.int(1, "GROWTH · min benchmark regime (0-2)", display = display.none, minval = 0, maxval = 2, group = "Growth lane")
 gr_cool       = input.int(20, "GROWTH · cooldown bars after a deploy (0 = off)", display = display.none, minval = 0, maxval = 120, group = "Growth lane",
      tooltip = "A rising-50D touch can repeat for days while price rides the average. 20 bars = roughly one signal per month per name.")
+gr_requireAccel = input.bool(false, "GROWTH · require EPS acceleration (accel code >= 1, UNVALIDATED)", display = display.none, group = "Growth lane",
+     tooltip = "Quarterly EPS YoY growth rising versus the prior quarter (code 1) or the prior two (code 2). OFF by default: it is a column and a dashboard cell until forward-test data says it earns a gate.")
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ INDICATOR LENGTHS (ASR v3 defaults — daily bars)                         ║
@@ -236,10 +259,99 @@ revGrowth = request.financial(syminfo.tickerid, "REVENUE_ONE_YEAR_GROWTH", gr_re
 epsGrowth = request.financial(syminfo.tickerid, "EARNINGS_PER_SHARE_DILUTED_ONE_YEAR_GROWTH", gr_epsPeriod, ignore_invalid_symbol = true)
 fundOk    = not na(revGrowth) and not na(epsGrowth)
 
-// ── Earnings calendar (built-in, not a request call) ───────────────────────
+// ── Quarterly acceleration (requests #5, #6; v2.2) ──────────────────────────
+// FQ series step on each report. The n-th most recent distinct value is the
+// n-th most recent quarter; YoY growth compares quarter n with quarter n+4.
+epsQ = request.financial(syminfo.tickerid, "EARNINGS_PER_SHARE_DILUTED", "FQ", ignore_invalid_symbol = true)
+revQ = request.financial(syminfo.tickerid, "TOTAL_REVENUE", "FQ", ignore_invalid_symbol = true)
+f_qv(float s, simple int n) => ta.valuewhen(not na(s[1]) and s != s[1], s, n)
+f_yoy(float a, float b) => na(a) or na(b) or b <= 0.0 ? na : (a / b - 1.0) * 100.0
+epsQ0 = f_qv(epsQ, 0)
+epsQ1 = f_qv(epsQ, 1)
+epsQ2 = f_qv(epsQ, 2)
+epsQ4 = f_qv(epsQ, 4)
+epsQ5 = f_qv(epsQ, 5)
+epsQ6 = f_qv(epsQ, 6)
+revQ0 = f_qv(revQ, 0)
+revQ1 = f_qv(revQ, 1)
+revQ2 = f_qv(revQ, 2)
+revQ4 = f_qv(revQ, 4)
+revQ5 = f_qv(revQ, 5)
+revQ6 = f_qv(revQ, 6)
+epsG0 = f_yoy(epsQ0, epsQ4)
+epsG1 = f_yoy(epsQ1, epsQ5)
+epsG2 = f_yoy(epsQ2, epsQ6)
+revG0 = f_yoy(revQ0, revQ4)
+revG1 = f_yoy(revQ1, revQ5)
+revG2 = f_yoy(revQ2, revQ6)
+f_accel(float g0, float g1, float g2) => na(g0) or na(g1) ? na : g0 > g1 ? (na(g2) ? 1.0 : g1 > g2 ? 2.0 : 1.0) : 0.0
+epsAccel = f_accel(epsG0, epsG1, epsG2)
+revAccel = f_accel(revG0, revG1, revG2)
+epsBigQ  = (nz(epsG0) >= 25.0 ? 1.0 : 0.0) + (nz(epsG1) >= 25.0 ? 1.0 : 0.0) + (nz(epsG2) >= 25.0 ? 1.0 : 0.0)   // CAN SLIM "C": quarters ≥ 25%
+accelOk  = nz(epsAccel) >= 1.0
+
+// ── Sector ETF: RS vs the symbol's own sector (request #7; v2.2) ───────────
+// TradingView sectors (syminfo.sector) mapped to the SPDR that holds them.
+// REITs sit in "Finance" here; Industrial Services holds oilfield services.
+secSym = switch syminfo.sector
+    "Technology Services"    => "AMEX:XLK"
+    "Electronic Technology"  => "AMEX:XLK"
+    "Finance"                => "AMEX:XLF"
+    "Health Technology"      => "AMEX:XLV"
+    "Health Services"        => "AMEX:XLV"
+    "Consumer Non-Durables"  => "AMEX:XLP"
+    "Consumer Durables"      => "AMEX:XLY"
+    "Consumer Services"      => "AMEX:XLY"
+    "Retail Trade"           => "AMEX:XLY"
+    "Producer Manufacturing" => "AMEX:XLI"
+    "Industrial Services"    => "AMEX:XLI"
+    "Transportation"         => "AMEX:XLI"
+    "Commercial Services"    => "AMEX:XLI"
+    "Distribution Services"  => "AMEX:XLI"
+    "Energy Minerals"        => "AMEX:XLE"
+    "Non-Energy Minerals"    => "AMEX:XLB"
+    "Process Industries"     => "AMEX:XLB"
+    "Utilities"              => "AMEX:XLU"
+    "Communications"         => "AMEX:XLC"
+    => benchSym
+secClose  = request.security(secSym, timeframe.period, close, ignore_invalid_symbol = true)
+secOk     = not na(secClose) and secSym != benchSym
+secSma50  = ta.sma(secClose, 50)
+secSma200 = ta.sma(secClose, 200)
+secTrend  = not secOk or na(secSma200) ? na : secClose > secSma200 ? (secSma50 > secSma50[10] ? 2.0 : 1.0) : 0.0
+rsSec3m   = secOk and close[63] > 0 and secClose[63] > 0 ? ((close / close[63]) / (secClose / secClose[63]) - 1.0) * 100.0 : na
+secCode   = secSym == "AMEX:XLK" ? 1.0 : secSym == "AMEX:XLF" ? 2.0 : secSym == "AMEX:XLV" ? 3.0 : secSym == "AMEX:XLP" ? 4.0 : secSym == "AMEX:XLY" ? 5.0 : secSym == "AMEX:XLI" ? 6.0 : secSym == "AMEX:XLE" ? 7.0 : secSym == "AMEX:XLB" ? 8.0 : secSym == "AMEX:XLU" ? 9.0 : secSym == "AMEX:XLC" ? 10.0 : 0.0
+secTag    = str.replace(secSym, "AMEX:", "", 0)
+
+// ── Breadth: % of S&P 500 above its 50D / 200D (requests #8, #9; v2.2) ─────
+s5fi = request.security("INDEX:S5FI", "1D", close, ignore_invalid_symbol = true)
+s5th = request.security("INDEX:S5TH", "1D", close, ignore_invalid_symbol = true)
+breadthOk = not na(s5fi) and not na(s5th)
+
+// ── Earnings calendar (built-in + cadence estimate; requests #10, #11) ──────
+// earnings.future_time is NOT supplied inside the Pine Screener, not even through
+// a request.security() wrapper (probed 2026-10-24). request.earnings() IS, and
+// its series steps on every report bar. So when the exact date is missing, the
+// next report is projected: last report bar + the interval that followed the
+// same report one year earlier (fallback: last interval, then 63 bars).
 earnT = earnings.future_time
-float daysToEarn = na(earnT) ? na : math.round((earnT - time_close) / 86400000.0)
-earnKnown = not na(daysToEarn) and daysToEarn >= 0
+float daysToEarnExact = na(earnT) ? na : math.round((earnT - time_close) / 86400000.0)
+earnKnown = not na(daysToEarnExact) and daysToEarnExact >= 0
+eAct   = request.earnings(syminfo.tickerid, earnings.actual, ignore_invalid_symbol = true)
+eStd   = request.earnings(syminfo.tickerid, earnings.standardized, ignore_invalid_symbol = true)
+repBar = (not na(eAct[1]) and eAct != eAct[1]) or (not na(eStd[1]) and eStd != eStd[1])
+int r0 = ta.valuewhen(repBar, bar_index, 0)
+int r1 = ta.valuewhen(repBar, bar_index, 1)
+int r3 = ta.valuewhen(repBar, bar_index, 3)
+int r4 = ta.valuewhen(repBar, bar_index, 4)
+float ivSeason = na(r3) or na(r4) ? na : r3 - r4
+float ivLast   = na(r0) or na(r1) ? na : r0 - r1
+float ivNext   = not na(ivSeason) and ivSeason >= 40 and ivSeason <= 90 ? ivSeason : not na(ivLast) and ivLast >= 40 and ivLast <= 90 ? ivLast : 63.0
+float barsToEarnEst = na(r0) ? na : math.max(0.0, r0 + ivNext - bar_index)
+float daysToEarnEst = na(barsToEarnEst) ? na : math.round(barsToEarnEst * 7.0 / 5.0)
+earnEstKnown = earnEstOn and not earnKnown and not na(daysToEarnEst)
+float daysToEarn = earnKnown ? daysToEarnExact : earnEstKnown ? daysToEarnEst : na
+earnAnyKnown = earnKnown or earnEstKnown
 
 // ── Warm-up ────────────────────────────────────────────────────────────────
 warmOk = bar_index >= 266 and not na(sma200) and not na(atrPctile) and not na(hi52) and not na(wkF) and not na(rvPctile)
@@ -387,7 +499,7 @@ grRoomPct = hi52 > 0 ? (hi52 / close - 1.0) * 100.0 : na
 
 // Common gates
 liqOk   = (minAdvM <= 0.0 or (not na(advUsd) and advUsd >= minAdvM * 1000000.0)) and (minPrice <= 0.0 or close >= minPrice)
-f_earnOk(int days) => days <= 0 or not earnKnown or daysToEarn > days
+f_earnOk(int days) => days <= 0 or not earnAnyKnown or daysToEarn > days + (earnEstKnown ? earnEstCushion : 0)
 f_mktOk(int minReg) => minReg <= 0 or na(mktRegime) or mktRegime >= minReg
 
 // Cooldown: one signal per setup per lane (v1.0 had this; the screener edition
@@ -401,7 +513,7 @@ grCoolOk = gr_cool <= 0 or na(grDepBar) or bar_index - grDepBar > gr_cool
 
 swDeploy = warmOk and swTrig and liqOk and swR >= minRR and f_earnOk(sw_earnDays) and f_mktOk(sw_mktMin) and swCoolOk
 poDeploy = warmOk and po_elig and liqOk and poR >= minRR and f_earnOk(po_earnDays) and f_mktOk(po_mktMin) and poCoolOk
-grDeploy = warmOk and gr_trig and gr_score >= gr_gate and liqOk and (not gr_requireFund or fundOk) and not na(grRiskPct) and grRiskPct <= gr_maxRisk and f_earnOk(gr_earnDays) and f_mktOk(gr_mktMin) and grCoolOk
+grDeploy = warmOk and gr_trig and gr_score >= gr_gate and liqOk and (not gr_requireFund or fundOk) and (not gr_requireAccel or accelOk) and not na(grRiskPct) and grRiskPct <= gr_maxRisk and f_earnOk(gr_earnDays) and f_mktOk(gr_mktMin) and grCoolOk
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ LANE STATE — last trigger per lane (frozen while the bar is forming)     ║
@@ -463,6 +575,10 @@ warmO      = ob(warmOk)
 benchO     = ob(benchOk)
 fundO      = ob(fundOk)
 earnKnownO = ob(earnKnown)
+earnEstO   = ob(earnEstKnown)
+accelOkO   = ob(accelOk)
+secOkO     = ob(secOk)
+breadthO   = ob(breadthOk)
 liqO       = ob(liqOk)
 swTrigO    = ob(swTrig)
 poEligO    = ob(po_elig)
@@ -506,9 +622,20 @@ grTtO      = o(gr_ttCount)
 grRoomO    = o(grRoomPct)
 entryO     = o(entryRef)
 dteO       = o(daysToEarn)
+dteExactO  = o(daysToEarnExact)
+dteEstO    = o(daysToEarnEst)
 mktO       = o(mktRegime)
 rs3mO      = o(rs3m)
 rs6mO      = o(rs6m)
+rsSecO     = o(rsSec3m)
+secTrendO  = o(secTrend)
+s5fiO      = o(s5fi)
+s5thO      = o(s5th)
+epsG0O     = o(epsG0)
+revG0O     = o(revG0)
+epsAccelO  = o(epsAccel)
+revAccelO  = o(revAccel)
+epsBigQO   = o(epsBigQ)
 advO       = o(advUsd)
 revO       = o(revGrowth)
 epsO       = o(epsGrowth)
@@ -534,15 +661,16 @@ tpPx      = horizon == 2 ? poTpO : horizon == 1 ? swTpO : na
 riskPct   = horizon == 3 ? grRiskO : horizon == 2 ? poRiskO : horizon == 1 ? swRiskO : na
 rMult     = horizon == 2 ? poRO : horizon == 1 ? swRO : na
 anyTrigToday = (swTrigO or poEligO or grTrigO) and warmO
-dataBits  = (warmO ? 1 : 0) + (benchO ? 2 : 0) + (fundO ? 4 : 0) + (earnKnownO ? 8 : 0) + (isDailyTF ? 16 : 0)
+dataBits  = (warmO ? 1 : 0) + (benchO ? 2 : 0) + (fundO ? 4 : 0) + (earnKnownO ? 8 : 0) + (isDailyTF ? 16 : 0) + (earnEstO ? 32 : 0) + (secOkO ? 64 : 0) + (breadthO ? 128 : 0)
 
 // Block reasons: the one gate responsible, named (never a bare "no trigger"
 // when a strategy did trigger and lost to its score gate).
 f_n(float v) => str.tostring(v, "#")
+earnTxt = earnKnownO ? "EARNINGS " + f_n(dteO) + "d" : earnEstO ? "EARNINGS ~" + f_n(dteO) + "d est" : "EARNINGS"
 swTrigWhy = s4TrigO ? "S4 " + f_n(s4ScoreO) + "<" + f_n(sw_s4Gate) : s3TrigO ? "S3 " + f_n(s3ScoreO) + "<" + f_n(sw_s3Gate) : s1TrigO ? "S1 trend " + f_n(s1TrendO) + "<" + f_n(sw_s1Gate) : "no trigger"
-blockSw = not warmO ? "WARMUP" : not swTrigO ? swTrigWhy : not liqO ? "LIQUIDITY" : swRO < minRR ? "R:R " + str.tostring(swRO, "0.0") : not swEarnO ? "EARNINGS " + f_n(dteO) + "d" : not swMktO ? "MKT REGIME" : not swCoolO ? "COOLDOWN " + f_n(swCoolRem) : "DEPLOY"
-blockPo = not warmO ? "WARMUP" : not poEligO ? (s4TrigO ? "S4 " + f_n(s4ScoreO) + "<" + f_n(po_s4Gate) : "no trigger") : not liqO ? "LIQUIDITY" : poRO < minRR ? "R:R " + str.tostring(poRO, "0.0") : not poEarnO ? "EARNINGS " + f_n(dteO) + "d" : not poMktO ? "MKT REGIME" : not poCoolO ? "COOLDOWN " + f_n(poCoolRem) : "DEPLOY"
-blockGr = not warmO ? "WARMUP" : not grTrigO ? "no trigger" : grScoreO < gr_gate ? "score " + f_n(grScoreO) + "<" + f_n(gr_gate) : not liqO ? "LIQUIDITY" : (gr_requireFund and not fundO) ? "NO FUND DATA" : (na(grRiskO) or grRiskO > gr_maxRisk) ? "RISK " + str.tostring(grRiskO, "0.#") + "%>" + f_n(gr_maxRisk) : not grEarnO ? "EARNINGS " + f_n(dteO) + "d" : not grMktO ? "MKT REGIME" : not grCoolO ? "COOLDOWN " + f_n(grCoolRem) : "DEPLOY"
+blockSw = not warmO ? "WARMUP" : not swTrigO ? swTrigWhy : not liqO ? "LIQUIDITY" : swRO < minRR ? "R:R " + str.tostring(swRO, "0.0") : not swEarnO ? earnTxt : not swMktO ? "MKT REGIME" : not swCoolO ? "COOLDOWN " + f_n(swCoolRem) : "DEPLOY"
+blockPo = not warmO ? "WARMUP" : not poEligO ? (s4TrigO ? "S4 " + f_n(s4ScoreO) + "<" + f_n(po_s4Gate) : "no trigger") : not liqO ? "LIQUIDITY" : poRO < minRR ? "R:R " + str.tostring(poRO, "0.0") : not poEarnO ? earnTxt : not poMktO ? "MKT REGIME" : not poCoolO ? "COOLDOWN " + f_n(poCoolRem) : "DEPLOY"
+blockGr = not warmO ? "WARMUP" : not grTrigO ? "no trigger" : grScoreO < gr_gate ? "score " + f_n(grScoreO) + "<" + f_n(gr_gate) : not liqO ? "LIQUIDITY" : (gr_requireFund and not fundO) ? "NO FUND DATA" : (gr_requireAccel and not accelOkO) ? "NO EPS ACCEL" : (na(grRiskO) or grRiskO > gr_maxRisk) ? "RISK " + str.tostring(grRiskO, "0.#") + "%>" + f_n(gr_maxRisk) : not grEarnO ? earnTxt : not grMktO ? "MKT REGIME" : not grCoolO ? "COOLDOWN " + f_n(grCoolRem) : "DEPLOY"
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ SCREENER COLUMNS — the first 10 are the default view, in decision order  ║
@@ -556,7 +684,7 @@ plot(stratCode,         "Strategy (1 MR 3 MOM 4 MTF 5 PB50 6 RECLAIM 7 BASE)", d
 plot(lanesBits,         "Lanes Deploy (bits 1 SW 2 POS 4 GR)",                 display = colDisp)
 plot(riskPct,           "Risk %",                                              display = colDisp)
 plot(rMult,             "R Multiple",                                          display = colDisp)
-plot(dteO,              "Days to Earnings",                                    display = colDisp)
+plot(dteO,              "Days to Earnings (exact, else cadence est)",          display = colDisp)
 plot(mktO,              "Mkt Regime (0 below 200D, 1 above, 2 above + rising 50D)", display = colDisp)
 plot(rs3mO,             "RS 3M %",                                             display = colDisp)
 plot(advO / 1000000.0,  "ADV $M (20d)",                                        display = colDisp)
@@ -592,7 +720,19 @@ plot(atrPctO,           "ATR Pctile (252d)",                                   d
 plot(rvPctO,            "RelVol Pctile (50d)",                                 display = colDisp)
 plot(rsiO,              "RSI 14",                                              display = colDisp)
 plot(regimeO,           "Regime (0 N 1 MR 2 BO 3 MOM 4 TR)",                   display = colDisp)
-plot(dataBits,          "Data OK (bits 1 warm 2 bench 4 fund 8 earn 16 1D)",   display = colDisp)
+// ── v2.2: earnings estimate, sector, breadth, quarterly acceleration ──
+plot(dteEstO,           "Days to Earnings Est (cadence)",                      display = colDisp)
+plot(secCode,           "Sector ETF (1 XLK 2 XLF 3 XLV 4 XLP 5 XLY 6 XLI 7 XLE 8 XLB 9 XLU 10 XLC)", display = colDisp)
+plot(rsSecO,            "Sector RS 3M %",                                      display = colDisp)
+plot(secTrendO,         "Sector Trend (0 below 200D, 1 above, 2 above + rising 50D)", display = colDisp)
+plot(s5fiO,             "Breadth Pct Above 50D (S5FI)",                        display = colDisp)
+plot(s5thO,             "Breadth Pct Above 200D (S5TH)",                       display = colDisp)
+plot(epsG0O,            "EPS YoY Latest Q %",                                  display = colDisp)
+plot(epsAccelO,         "EPS Accel (0-2 rising quarters)",                     display = colDisp)
+plot(epsBigQO,          "EPS Quarters 25pct Plus (0-3)",                       display = colDisp)
+plot(revG0O,            "Rev YoY Latest Q %",                                  display = colDisp)
+plot(revAccelO,         "Rev Accel (0-2 rising quarters)",                     display = colDisp)
+plot(dataBits,          "Data OK (bits 1 warm 2 bench 4 fund 8 earn 16 1D 32 earn est 64 sector 128 breadth)", display = colDisp)
 
 // ── boolean filters ──
 alertcondition(swD, "ADS2 Swing deploy", "ADS2 swing deploy on {{ticker}}")
@@ -713,7 +853,7 @@ if previewOk
 // with the reason, so a Screener row never looks like a missing drawing.
 swBlkE  = warmO and swTrigO and liqO and swRO >= minRR and not swEarnO and swMktO and swCoolO
 poBlkE  = warmO and poEligO and liqO and poRO >= minRR and not poEarnO and poMktO and poCoolO
-grBlkE  = warmO and grTrigO and grScoreO >= gr_gate and liqO and (not gr_requireFund or fundO) and not na(grRiskO) and grRiskO <= gr_maxRisk and not grEarnO and grMktO and grCoolO
+grBlkE  = warmO and grTrigO and grScoreO >= gr_gate and liqO and (not gr_requireFund or fundO) and (not gr_requireAccel or accelOkO) and not na(grRiskO) and grRiskO <= gr_maxRisk and not grEarnO and grMktO and grCoolO
 blkLane = horizon > 0 ? 0 : grBlkE ? 3 : (poBlkE and poStructO >= po_minStruct) ? 2 : swBlkE ? 1 : 0
 blkStop = blkLane == 3 ? grStopO : blkLane == 2 ? poStopO : blkLane == 1 ? swStopO : na
 blkTp   = blkLane == 2 ? poTpO : blkLane == 1 ? swTpO : na
@@ -721,7 +861,7 @@ blkRisk = blkLane == 3 ? grRiskO : blkLane == 2 ? poRiskO : blkLane == 1 ? swRis
 blkR    = blkLane == 2 ? poRO : blkLane == 1 ? swRO : na
 blkScr  = blkLane == 3 ? grScoreO : blkLane == 2 ? s4ScoreO : blkLane == 1 ? swScoreO : 0.0
 blkTag  = f_laneName(blkLane) + " " + (blkLane == 3 ? grLabel : blkLane == 2 ? "MTF" : blkLane == 1 ? swLabel : "--")
-blkWhy  = "EARNINGS " + f_n(dteO) + "d"
+blkWhy  = earnTxt
 
 var line  bkEnt  = na
 var line  bkSL   = na
@@ -775,7 +915,7 @@ plotshape(mk and horizon == 3 and showLaneLabel, "Growth deploy (G)", shape.labe
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ DASHBOARD (v1.0 layout: strategy rows → winner → risk → position → context)║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-var table tbl = table.new(dashPos, 4, 17, border_color = color.gray, border_width = 1, frame_color = color.gray, frame_width = 2)
+var table tbl = table.new(dashPos, 4, 18, border_color = color.gray, border_width = 1, frame_color = color.gray, frame_width = 2)
 if barstate.islast and showDash
     okC = color.green
     noC = color.gray
@@ -856,10 +996,14 @@ if barstate.islast and showDash
     table.cell(tbl, 2, 14, "RS 3M " + str.tostring(rs3mO, "0.#") + "% · 6M " + str.tostring(rs6mO, "0.#") + "%", text_color = rs3mO > 0 ? okC : color.red, text_size = size.tiny)
     table.cell(tbl, 3, 14, "12-1 " + str.tostring(mom121O, "0.#") + "%", text_color = mom121O > 0 ? okC : color.red, text_size = size.tiny)
     table.cell(tbl, 0, 15, "Fund / Earn", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 15, "rev " + str.tostring(revO, "0.#") + "% · eps " + str.tostring(epsO, "0.#") + "%", text_color = fundO ? wC : noC, text_size = size.tiny)
-    table.cell(tbl, 2, 15, earnKnownO ? "earnings " + f_n(dteO) + "d" : "earnings n/a", text_color = earnKnownO and dteO <= 7 ? color.red : wC, text_size = size.tiny)
+    table.cell(tbl, 1, 15, "rev " + str.tostring(revO, "0.#") + "% · eps " + str.tostring(epsO, "0.#") + "% · Q " + (na(epsG0O) ? "n/a" : (epsG0O >= 0 ? "+" : "") + str.tostring(epsG0O, "0") + "%") + " accel " + (na(epsAccelO) ? "-" : f_n(epsAccelO)), text_color = fundO ? wC : noC, text_size = size.tiny)
+    table.cell(tbl, 2, 15, earnKnownO ? "earnings " + f_n(dteO) + "d" : earnEstO ? "earnings ~" + f_n(dteO) + "d (est)" : "earnings n/a", text_color = (earnKnownO or earnEstO) and dteO <= 7 ? color.red : wC, text_size = size.tiny)
     table.cell(tbl, 3, 15, "ADV $" + str.tostring(advO / 1000000.0, "0.#") + "M", text_color = liqO ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 16, "Cooldown", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 16, "SW " + (swCoolRem > 0 ? f_n(swCoolRem) + "b" : "READY") + " · POS " + (poCoolRem > 0 ? f_n(poCoolRem) + "b" : "READY") + " · GR " + (grCoolRem > 0 ? f_n(grCoolRem) + "b" : "READY"), text_color = swCoolRem + poCoolRem + grCoolRem > 0 ? color.orange : okC, text_size = size.tiny)
-    table.cell(tbl, 2, 16, (isDailyTF ? "1D ok" : "NOT 1D") + (warmO ? "" : " · WARMUP"), text_color = isDailyTF and warmO ? noC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 16, "v2.1.1", text_color = noC, text_size = size.tiny)
+    table.cell(tbl, 0, 16, "Sector / Breadth", bgcolor = hdrBg, text_color = wC, text_size = size.small)
+    table.cell(tbl, 1, 16, secOkO ? secTag + " RS 3M " + (rsSecO >= 0 ? "+" : "") + str.tostring(rsSecO, "0.#") + "% · trend " + f_n(secTrendO) : "sector n/a", text_color = secOkO ? (rsSecO > 0 ? okC : color.red) : noC, text_size = size.tiny)
+    table.cell(tbl, 2, 16, breadthO ? "S&P above 50D " + f_n(s5fiO) + "% · 200D " + f_n(s5thO) + "%" : "breadth n/a", text_color = breadthO ? (s5thO >= 50 ? okC : color.red) : noC, text_size = size.tiny)
+    table.cell(tbl, 3, 16, na(revG0O) ? "rev Q n/a" : "rev Q " + (revG0O >= 0 ? "+" : "") + str.tostring(revG0O, "0") + "% accel " + (na(revAccelO) ? "-" : f_n(revAccelO)), text_color = na(revG0O) ? noC : revG0O > 0 ? okC : color.red, text_size = size.tiny)
+    table.cell(tbl, 0, 17, "Cooldown", bgcolor = hdrBg, text_color = wC, text_size = size.small)
+    table.cell(tbl, 1, 17, "SW " + (swCoolRem > 0 ? f_n(swCoolRem) + "b" : "READY") + " · POS " + (poCoolRem > 0 ? f_n(poCoolRem) + "b" : "READY") + " · GR " + (grCoolRem > 0 ? f_n(grCoolRem) + "b" : "READY"), text_color = swCoolRem + poCoolRem + grCoolRem > 0 ? color.orange : okC, text_size = size.tiny)
+    table.cell(tbl, 2, 17, (isDailyTF ? "1D ok" : "NOT 1D") + (warmO ? "" : " · WARMUP"), text_color = isDailyTF and warmO ? noC : color.red, text_size = size.tiny)
+    table.cell(tbl, 3, 17, "v2.2.0", text_color = noC, text_size = size.tiny)
