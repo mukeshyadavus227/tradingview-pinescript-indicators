@@ -5,7 +5,7 @@
 indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
 
 // ============================================================================
-// ADAPTIVE DAILY SCANNER  v2.2.0  (2026-10-24)  — Pine Screener edition, 1D close
+// ADAPTIVE DAILY SCANNER  v2.2.1  (2026-10-24)  — Pine Screener edition, 1D close
 //
 // LINEAGE
 //   Portfolio Scanner v5 [CODEX] → Adaptive Swing Scanner v1.0 (4H, 2026-05-16)
@@ -82,6 +82,9 @@ indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
 //       three quarters, acceleration code (0-2) and the CAN SLIM "C" count
 //       (quarters ≥ 25%). Columns + dashboard; optional growth gate, OFF.
 //     Nothing new gates a deploy by default. Validate first, then gate.
+//   • v2.2.1: dashboard footprint is user-controlled — "Chart: dashboard text
+//     size" (compact default · normal · large) and "Chart: dashboard context
+//     rows" (OFF = 12 decision rows instead of 18).
 //
 // PINE SCREENER CONSTRAINTS HONOURED
 //   • request.*() calls: weekly tuple (1) + benchmark (1) + financials 1Y (2) +
@@ -196,6 +199,10 @@ showShapes    = input.bool(true, "Chart: deploy markers", display = display.none
 showDash      = input.bool(true, "Chart: dashboard", display = display.none, group = "Display")
 dashPos       = input.string("top_right", "Chart: dashboard position", display = display.none, options = ["top_right", "top_left", "middle_right", "middle_left", "bottom_right", "bottom_left"], group = "Display",
      tooltip = "Move it when another indicator's table (v1.0, CLS) already sits top-right.")
+dashSize      = input.string("compact", "Chart: dashboard text size", display = display.none, options = ["compact", "normal", "large"], group = "Display",
+     tooltip = "compact = small headers, tiny text (about half the footprint of normal). normal = the v2.1 look. large = for 4K screens or screenshots.")
+showContext   = input.bool(true, "Chart: dashboard context rows (RSI, 52wk, Market, Fund / Earn, Sector / Breadth, Cooldown)", display = display.none, group = "Display",
+     tooltip = "OFF keeps only the decision rows: strategies, lanes, winner, risk, reference position. Cooldown state still shows in the lane rows as COOLDOWN n.")
 levelBars     = input.int(20, "Chart: level line length (bars)", display = display.none, minval = 5, maxval = 60, group = "Display")
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
@@ -920,95 +927,101 @@ plotshape(mk and horizon == 3, "Growth deploy", shape.triangleup, location.below
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ DASHBOARD (v1.0 layout: strategy rows → winner → risk → position → context)║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-var table tbl = table.new(dashPos, 4, 18, border_color = color.gray, border_width = 1, frame_color = color.gray, frame_width = 2)
+// Text sizes by the dashboard size input (table text_size takes a series string).
+szHdr = dashSize == "compact" ? size.small : dashSize == "large" ? size.large : size.normal
+szLbl = dashSize == "compact" ? size.tiny : dashSize == "large" ? size.normal : size.small
+szVal = dashSize == "large" ? size.small : size.tiny
+var table tbl = table.new(dashPos, 4, showContext ? 18 : 12, border_color = color.gray, border_width = 1, frame_color = color.gray, frame_width = dashSize == "compact" ? 1 : 2)
 if barstate.islast and showDash
     okC = color.green
     noC = color.gray
     wC  = color.white
     hdrBg = color.navy
     // header
-    table.cell(tbl, 0, 0, syminfo.ticker, bgcolor = color.black, text_color = wC, text_size = size.normal)
-    table.cell(tbl, 1, 0, timeframe.period + (off == 1 ? " prev" : ""), bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 2, 0, "Score", bgcolor = color.black, text_color = wC, text_size = size.small)
-    table.cell(tbl, 3, 0, "Status", bgcolor = color.black, text_color = wC, text_size = size.small)
+    table.cell(tbl, 0, 0, syminfo.ticker, bgcolor = color.black, text_color = wC, text_size = szHdr)
+    table.cell(tbl, 1, 0, timeframe.period + (off == 1 ? " prev" : ""), bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 2, 0, "Score", bgcolor = color.black, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 3, 0, "Status", bgcolor = color.black, text_color = wC, text_size = szLbl)
     // regime (metadata)
     rgC = regimeO == 4 ? color.green : regimeO == 2 ? color.yellow : regimeO == 3 ? color.blue : regimeO == 1 ? color.purple : color.gray
-    table.cell(tbl, 0, 1, "REGIME", bgcolor = color.maroon, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 1, regLabel, text_color = rgC, text_size = size.small)
-    table.cell(tbl, 2, 1, f_n(regConfO), text_color = rgC, text_size = size.small)
-    table.cell(tbl, 3, 1, "ADX=" + f_n(adxO) + " CH=" + f_n(chopO) + " · metadata", text_color = wC, text_size = size.tiny)
+    table.cell(tbl, 0, 1, "REGIME", bgcolor = color.maroon, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 1, regLabel, text_color = rgC, text_size = szLbl)
+    table.cell(tbl, 2, 1, f_n(regConfO), text_color = rgC, text_size = szLbl)
+    table.cell(tbl, 3, 1, "ADX=" + f_n(adxO) + " CH=" + f_n(chopO) + " · metadata", text_color = wC, text_size = szVal)
     // strategy rows
-    table.cell(tbl, 0, 2, "S1 MeanRev", bgcolor = color.new(color.purple, 50), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 2, s1TrigO ? "TRIG" : "—", text_color = s1TrigO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 2, 2, f_n(s1ScoreO), text_color = s1EligO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 2, s1EligO ? "ELIGIBLE" : s1TrigO ? "trend " + f_n(s1TrendO) + "<" + f_n(sw_s1Gate) : "—", text_color = s1EligO ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 3, "S3 Momentum", bgcolor = color.new(color.blue, 50), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 3, s3TrigO ? "TRIG" : "—", text_color = s3TrigO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 2, 3, f_n(s3ScoreO) + "/" + f_n(sw_s3Gate), text_color = s3EligO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 3, s3EligO ? "ELIGIBLE" : s3TrigO ? "score<gate" : "—", text_color = s3EligO ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 4, "S4 MTF Trend", bgcolor = color.new(color.teal, 50), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 4, s4TrigO ? "TRIG" : "—", text_color = s4TrigO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 2, 4, f_n(s4ScoreO) + "/" + f_n(sw_s4Gate), text_color = s4EligO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 4, s4EligO ? "ELIGIBLE" : s4TrigO ? "score<gate" : "—", text_color = s4EligO ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 5, "GROWTH " + grLabel, bgcolor = color.new(color.purple, 65), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 5, grTrigO ? "TRIG" : "—", text_color = grTrigO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 2, 5, f_n(grScoreO) + "/" + f_n(gr_gate) + " tt " + f_n(grTtO) + "/5", text_color = grTrigO and grScoreO >= gr_gate ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 5, grTrigO ? (grScoreO >= gr_gate ? "ELIGIBLE" : "score<gate") : "—", text_color = grTrigO and grScoreO >= gr_gate ? okC : noC, text_size = size.tiny)
+    table.cell(tbl, 0, 2, "S1 MeanRev", bgcolor = color.new(color.purple, 50), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 2, s1TrigO ? "TRIG" : "—", text_color = s1TrigO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 2, 2, f_n(s1ScoreO), text_color = s1EligO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 2, s1EligO ? "ELIGIBLE" : s1TrigO ? "trend " + f_n(s1TrendO) + "<" + f_n(sw_s1Gate) : "—", text_color = s1EligO ? okC : noC, text_size = szVal)
+    table.cell(tbl, 0, 3, "S3 Momentum", bgcolor = color.new(color.blue, 50), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 3, s3TrigO ? "TRIG" : "—", text_color = s3TrigO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 2, 3, f_n(s3ScoreO) + "/" + f_n(sw_s3Gate), text_color = s3EligO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 3, s3EligO ? "ELIGIBLE" : s3TrigO ? "score<gate" : "—", text_color = s3EligO ? okC : noC, text_size = szVal)
+    table.cell(tbl, 0, 4, "S4 MTF Trend", bgcolor = color.new(color.teal, 50), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 4, s4TrigO ? "TRIG" : "—", text_color = s4TrigO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 2, 4, f_n(s4ScoreO) + "/" + f_n(sw_s4Gate), text_color = s4EligO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 4, s4EligO ? "ELIGIBLE" : s4TrigO ? "score<gate" : "—", text_color = s4EligO ? okC : noC, text_size = szVal)
+    table.cell(tbl, 0, 5, "GROWTH " + grLabel, bgcolor = color.new(color.purple, 65), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 5, grTrigO ? "TRIG" : "—", text_color = grTrigO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 2, 5, f_n(grScoreO) + "/" + f_n(gr_gate) + " tt " + f_n(grTtO) + "/5", text_color = grTrigO and grScoreO >= gr_gate ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 5, grTrigO ? (grScoreO >= gr_gate ? "ELIGIBLE" : "score<gate") : "—", text_color = grTrigO and grScoreO >= gr_gate ? okC : noC, text_size = szVal)
     // lanes
-    table.cell(tbl, 0, 6, "SWING", bgcolor = color.new(color.green, 70), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 6, swTrigO ? swLabel + " BUY" : "—", text_color = swD ? okC : swTrigO ? color.yellow : noC, text_size = size.small)
-    table.cell(tbl, 2, 6, f_n(swScoreO), text_color = swD ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 6, blockSw, text_color = blockSw == "DEPLOY" ? okC : swTrigO ? color.orange : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 7, "POSITIONAL", bgcolor = color.new(color.teal, 60), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 7, poEligO ? "MTF BUY · str " + f_n(poStructO) + "/5" : "str " + f_n(poStructO) + "/5", text_color = poD ? okC : poEligO ? color.yellow : noC, text_size = size.small)
-    table.cell(tbl, 2, 7, poEligO ? f_n(s4ScoreO) : "0", text_color = poD ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 7, blockPo, text_color = blockPo == "DEPLOY" ? okC : poEligO ? color.orange : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 8, "GROWTH", bgcolor = color.new(color.purple, 50), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 8, grTrigO ? grLabel + " BUY" : "—", text_color = grD ? okC : grTrigO ? color.yellow : noC, text_size = size.small)
-    table.cell(tbl, 2, 8, f_n(grScoreO), text_color = grD ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 8, blockGr, text_color = blockGr == "DEPLOY" ? okC : grTrigO ? color.orange : noC, text_size = size.tiny)
+    table.cell(tbl, 0, 6, "SWING", bgcolor = color.new(color.green, 70), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 6, swTrigO ? swLabel + " BUY" : "—", text_color = swD ? okC : swTrigO ? color.yellow : noC, text_size = szLbl)
+    table.cell(tbl, 2, 6, f_n(swScoreO), text_color = swD ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 6, blockSw, text_color = blockSw == "DEPLOY" ? okC : swTrigO ? color.orange : noC, text_size = szVal)
+    table.cell(tbl, 0, 7, "POSITIONAL", bgcolor = color.new(color.teal, 60), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 7, poEligO ? "MTF BUY · str " + f_n(poStructO) + "/5" : "str " + f_n(poStructO) + "/5", text_color = poD ? okC : poEligO ? color.yellow : noC, text_size = szLbl)
+    table.cell(tbl, 2, 7, poEligO ? f_n(s4ScoreO) : "0", text_color = poD ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 7, blockPo, text_color = blockPo == "DEPLOY" ? okC : poEligO ? color.orange : noC, text_size = szVal)
+    table.cell(tbl, 0, 8, "GROWTH", bgcolor = color.new(color.purple, 50), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 8, grTrigO ? grLabel + " BUY" : "—", text_color = grD ? okC : grTrigO ? color.yellow : noC, text_size = szLbl)
+    table.cell(tbl, 2, 8, f_n(grScoreO), text_color = grD ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 8, blockGr, text_color = blockGr == "DEPLOY" ? okC : grTrigO ? color.orange : noC, text_size = szVal)
     // winner
-    table.cell(tbl, 0, 9, "WINNER", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 9, horizon > 0 ? horLabel + " " + stratLbl + " BUY" : blkLane > 0 ? blkTag + " (screener row)" : "—", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : noC, text_size = size.small)
-    table.cell(tbl, 2, 9, horizon > 0 ? f_n(adsScore) : blkLane > 0 ? f_n(blkScr) : "0", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : color.red, text_size = size.small)
-    table.cell(tbl, 3, 9, horizon > 0 ? "DEPLOY" : blkLane > 0 ? "WAIT · " + blkWhy : "WAIT", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : noC, text_size = size.small)
+    table.cell(tbl, 0, 9, "WINNER", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 9, horizon > 0 ? horLabel + " " + stratLbl + " BUY" : blkLane > 0 ? blkTag + " (screener row)" : "—", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : noC, text_size = szLbl)
+    table.cell(tbl, 2, 9, horizon > 0 ? f_n(adsScore) : blkLane > 0 ? f_n(blkScr) : "0", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : color.red, text_size = szLbl)
+    table.cell(tbl, 3, 9, horizon > 0 ? "DEPLOY" : blkLane > 0 ? "WAIT · " + blkWhy : "WAIT", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : noC, text_size = szLbl)
     // risk for the winner (or the best triggered lane when nothing deploys)
     rkLane = horizon > 0 ? horizon : grTrigO ? 3 : poEligO ? 2 : swTrigO ? 1 : 0
     rkStop = rkLane == 3 ? grStopO : rkLane == 2 ? poStopO : rkLane == 1 ? swStopO : na
     rkTp   = rkLane == 2 ? poTpO : rkLane == 1 ? swTpO : na
     rkRisk = rkLane == 3 ? grRiskO : rkLane == 2 ? poRiskO : rkLane == 1 ? swRiskO : na
     rkR    = rkLane == 2 ? poRO : rkLane == 1 ? swRO : na
-    table.cell(tbl, 0, 10, "Risk " + (rkLane > 0 ? f_laneName(rkLane) : ""), bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 10, rkLane > 0 ? "SL $" + str.tostring(rkStop, "0.##") + " (" + str.tostring(rkRisk, "0.#") + "%)" : "—", text_color = color.orange, text_size = size.tiny)
-    table.cell(tbl, 2, 10, rkLane == 3 ? "exit: close<200D" : rkLane > 0 ? "TP $" + str.tostring(rkTp, "0.##") : "—", text_color = okC, text_size = size.tiny)
-    table.cell(tbl, 3, 10, rkLane == 3 ? "room " + str.tostring(grRoomO, "0.#") + "% to 52W hi" : rkLane > 0 ? "R:R " + str.tostring(rkR, "0.0") : "—", text_color = rkLane == 3 ? wC : rkR >= 2.0 ? okC : rkR >= minRR ? color.yellow : color.red, text_size = size.tiny)
+    table.cell(tbl, 0, 10, "Risk " + (rkLane > 0 ? f_laneName(rkLane) : ""), bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 10, rkLane > 0 ? "SL $" + str.tostring(rkStop, "0.##") + " (" + str.tostring(rkRisk, "0.#") + "%)" : "—", text_color = color.orange, text_size = szVal)
+    table.cell(tbl, 2, 10, rkLane == 3 ? "exit: close<200D" : rkLane > 0 ? "TP $" + str.tostring(rkTp, "0.##") : "—", text_color = okC, text_size = szVal)
+    table.cell(tbl, 3, 10, rkLane == 3 ? "room " + str.tostring(grRoomO, "0.#") + "% to 52W hi" : rkLane > 0 ? "R:R " + str.tostring(rkR, "0.0") : "—", text_color = rkLane == 3 ? wC : rkR >= 2.0 ? okC : rkR >= minRR ? color.yellow : color.red, text_size = szVal)
     // reference position
-    table.cell(tbl, 0, 11, "Position (ref)", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 11, refLane > 0 ? "LONG @ " + str.tostring(refEntry, "0.##") + " · " + refTag : "FLAT", text_color = refLane > 0 ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 2, 11, refLane > 0 ? (refPnlPct >= 0 ? "+" : "") + str.tostring(refPnlPct, "0.##") + "%" : "", text_color = refPnlPct >= 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 11, refLane > 0 ? "SL " + str.tostring(refSL, "0.##") + (na(refTP) ? " · exit<200D" : " · TP " + str.tostring(refTP, "0.##")) + " · " + str.tostring(bar_index - refBar) + "b" : "", text_color = wC, text_size = size.tiny)
+    table.cell(tbl, 0, 11, "Position (ref)", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 11, refLane > 0 ? "LONG @ " + str.tostring(refEntry, "0.##") + " · " + refTag : "FLAT", text_color = refLane > 0 ? okC : noC, text_size = szVal)
+    table.cell(tbl, 2, 11, refLane > 0 ? (refPnlPct >= 0 ? "+" : "") + str.tostring(refPnlPct, "0.##") + "%" : "", text_color = refPnlPct >= 0 ? okC : color.red, text_size = szVal)
+    table.cell(tbl, 3, 11, refLane > 0 ? "SL " + str.tostring(refSL, "0.##") + (na(refTP) ? " · exit<200D" : " · TP " + str.tostring(refTP, "0.##")) + " · " + str.tostring(bar_index - refBar) + "b" : "", text_color = wC, text_size = szVal)
     // context
-    table.cell(tbl, 0, 12, "RSI", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 12, str.tostring(rsiO, "0.#"), text_color = rsiO < 30 ? okC : rsiO > 70 ? color.red : wC, text_size = size.small)
-    table.cell(tbl, 2, 12, "rVol=" + f_n(rvPctO) + "p", text_color = rvPctO > 70 ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 3, 12, "ATR=" + f_n(atrPctO) + "p", text_color = wC, text_size = size.tiny)
-    table.cell(tbl, 0, 13, "52wk", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 13, f_n(distLoO) + "% from low", text_color = distLoO > 80 ? okC : distLoO < 20 ? color.red : wC, text_size = size.tiny)
-    table.cell(tbl, 2, 13, "ROC20=" + str.tostring(roc20O, "0.#") + "%", text_color = roc20O > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 13, "ROC60=" + str.tostring(roc60O, "0.#") + "%", text_color = roc60O > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 14, "Market", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 14, "SPY regime " + f_n(mktO), text_color = mktO >= 1 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 2, 14, "RS 3M " + str.tostring(rs3mO, "0.#") + "% · 6M " + str.tostring(rs6mO, "0.#") + "%", text_color = rs3mO > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 14, "12-1 " + str.tostring(mom121O, "0.#") + "%", text_color = mom121O > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 15, "Fund / Earn", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 15, "rev " + str.tostring(revO, "0.#") + "% · eps " + str.tostring(epsO, "0.#") + "% · Q " + (na(epsG0O) ? "n/a" : (epsG0O >= 0 ? "+" : "") + str.tostring(epsG0O, "0") + "%") + " accel " + (na(epsAccelO) ? "-" : f_n(epsAccelO)), text_color = fundO ? wC : noC, text_size = size.tiny)
-    table.cell(tbl, 2, 15, earnKnownO ? "earnings " + f_n(dteO) + "d" : earnEstO ? "earnings ~" + f_n(dteO) + "d (est)" : "earnings n/a", text_color = (earnKnownO or earnEstO) and dteO <= 7 ? color.red : wC, text_size = size.tiny)
-    table.cell(tbl, 3, 15, "ADV $" + str.tostring(advO / 1000000.0, "0.#") + "M", text_color = liqO ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 16, "Sector / Breadth", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 16, secOkO ? secTag + " RS 3M " + (rsSecO >= 0 ? "+" : "") + str.tostring(rsSecO, "0.#") + "% · trend " + f_n(secTrendO) : "sector n/a", text_color = secOkO ? (rsSecO > 0 ? okC : color.red) : noC, text_size = size.tiny)
-    table.cell(tbl, 2, 16, breadthO ? "S&P above 50D " + f_n(s5fiO) + "% · 200D " + f_n(s5thO) + "%" : "breadth n/a", text_color = breadthO ? (s5thO >= 50 ? okC : color.red) : noC, text_size = size.tiny)
-    table.cell(tbl, 3, 16, na(revG0O) ? "rev Q n/a" : "rev Q " + (revG0O >= 0 ? "+" : "") + str.tostring(revG0O, "0") + "% accel " + (na(revAccelO) ? "-" : f_n(revAccelO)), text_color = na(revG0O) ? noC : revG0O > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 17, "Cooldown", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 17, "SW " + (swCoolRem > 0 ? f_n(swCoolRem) + "b" : "READY") + " · POS " + (poCoolRem > 0 ? f_n(poCoolRem) + "b" : "READY") + " · GR " + (grCoolRem > 0 ? f_n(grCoolRem) + "b" : "READY"), text_color = swCoolRem + poCoolRem + grCoolRem > 0 ? color.orange : okC, text_size = size.tiny)
-    table.cell(tbl, 2, 17, (isDailyTF ? "1D ok" : "NOT 1D") + (warmO ? "" : " · WARMUP"), text_color = isDailyTF and warmO ? noC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 17, "v2.2.0", text_color = noC, text_size = size.tiny)
+    // context rows (optional)
+    if showContext
+        table.cell(tbl, 0, 12, "RSI", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 12, str.tostring(rsiO, "0.#"), text_color = rsiO < 30 ? okC : rsiO > 70 ? color.red : wC, text_size = szLbl)
+        table.cell(tbl, 2, 12, "rVol=" + f_n(rvPctO) + "p", text_color = rvPctO > 70 ? okC : noC, text_size = szVal)
+        table.cell(tbl, 3, 12, "ATR=" + f_n(atrPctO) + "p", text_color = wC, text_size = szVal)
+        table.cell(tbl, 0, 13, "52wk", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 13, f_n(distLoO) + "% from low", text_color = distLoO > 80 ? okC : distLoO < 20 ? color.red : wC, text_size = szVal)
+        table.cell(tbl, 2, 13, "ROC20=" + str.tostring(roc20O, "0.#") + "%", text_color = roc20O > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 3, 13, "ROC60=" + str.tostring(roc60O, "0.#") + "%", text_color = roc60O > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 0, 14, "Market", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 14, "SPY regime " + f_n(mktO), text_color = mktO >= 1 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 2, 14, "RS 3M " + str.tostring(rs3mO, "0.#") + "% · 6M " + str.tostring(rs6mO, "0.#") + "%", text_color = rs3mO > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 3, 14, "12-1 " + str.tostring(mom121O, "0.#") + "%", text_color = mom121O > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 0, 15, "Fund / Earn", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 15, "rev " + str.tostring(revO, "0.#") + "% · eps " + str.tostring(epsO, "0.#") + "% · Q " + (na(epsG0O) ? "n/a" : (epsG0O >= 0 ? "+" : "") + str.tostring(epsG0O, "0") + "%") + " accel " + (na(epsAccelO) ? "-" : f_n(epsAccelO)), text_color = fundO ? wC : noC, text_size = szVal)
+        table.cell(tbl, 2, 15, earnKnownO ? "earnings " + f_n(dteO) + "d" : earnEstO ? "earnings ~" + f_n(dteO) + "d (est)" : "earnings n/a", text_color = (earnKnownO or earnEstO) and dteO <= 7 ? color.red : wC, text_size = szVal)
+        table.cell(tbl, 3, 15, "ADV $" + str.tostring(advO / 1000000.0, "0.#") + "M", text_color = liqO ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 0, 16, "Sector / Breadth", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 16, secOkO ? secTag + " RS 3M " + (rsSecO >= 0 ? "+" : "") + str.tostring(rsSecO, "0.#") + "% · trend " + f_n(secTrendO) : "sector n/a", text_color = secOkO ? (rsSecO > 0 ? okC : color.red) : noC, text_size = szVal)
+        table.cell(tbl, 2, 16, breadthO ? "S&P above 50D " + f_n(s5fiO) + "% · 200D " + f_n(s5thO) + "%" : "breadth n/a", text_color = breadthO ? (s5thO >= 50 ? okC : color.red) : noC, text_size = szVal)
+        table.cell(tbl, 3, 16, na(revG0O) ? "rev Q n/a" : "rev Q " + (revG0O >= 0 ? "+" : "") + str.tostring(revG0O, "0") + "% accel " + (na(revAccelO) ? "-" : f_n(revAccelO)), text_color = na(revG0O) ? noC : revG0O > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 0, 17, "Cooldown", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 17, "SW " + (swCoolRem > 0 ? f_n(swCoolRem) + "b" : "READY") + " · POS " + (poCoolRem > 0 ? f_n(poCoolRem) + "b" : "READY") + " · GR " + (grCoolRem > 0 ? f_n(grCoolRem) + "b" : "READY"), text_color = swCoolRem + poCoolRem + grCoolRem > 0 ? color.orange : okC, text_size = szVal)
+        table.cell(tbl, 2, 17, (isDailyTF ? "1D ok" : "NOT 1D") + (warmO ? "" : " · WARMUP"), text_color = isDailyTF and warmO ? noC : color.red, text_size = szVal)
+        table.cell(tbl, 3, 17, "v2.2.1", text_color = noC, text_size = szVal)
