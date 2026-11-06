@@ -41,18 +41,21 @@ def stats(tr):
                 dd=(mo.cumsum() - mo.cumsum().cummax()).min(), mix={k: int(v) for k, v in tr.strat.value_counts().items()})
 
 
-L = ["# Slot-capped portfolio comparison\n",
-     "Same per-symbol trade lists as phase3_simulation.md, admitted through a concurrent-position cap with priority S1 > S4 > S3. R net of costs.\n"]
-for prof in ("SWING", "POSITIONAL"):
-    L.append(f"## {prof}\n")
-    L.append("| cap | system | trades | mean R | hit | PF | SR ann | R per year | worst month | max DD (R) | mix |\n|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
-    for cap in (5, 10, 20, 999):
-        for ver, fn in (("v2", f"sim_{prof}_v2.csv"), ("v3", f"sim_{prof}_v3.csv")):
-            tr = cap_run(pd.read_csv(OUT / fn), cap)
-            for split, d in (("all", tr), ("test", tr[tr.date >= SPLIT])):
-                s = stats(d)
-                L.append(f"| {cap if cap < 999 else '∞'} | {ver} {split} | {s['n']:,} | {s['meanR']:+.3f} | {s['hit']:.0%} | {s['pf']:.2f} | "
-                         f"{s['sr_ann']:+.2f} | {s['R_yr']:+.1f} | {s['worst']:+.1f} | {s['dd']:+.1f} | {s['mix']} |")
-    L.append("")
-(OUT / "phase3_slot_cap.md").write_text("\n".join(L))
-print("\n".join(L))
+# Report only when run as a script: importing cap_run/stats (final_v3.py, phase6_fill_baseline.py,
+# ads2_structure_gate.py) must not require out/sim_*.csv from a previous simulate.py run.
+if __name__ == "__main__":
+    L = ["# Slot-capped portfolio comparison\n",
+         "Same per-symbol trade lists as phase3_simulation.md, admitted through a concurrent-position cap with priority S1 > S4 > S3. R net of costs.\n"]
+    for prof in ("SWING", "POSITIONAL"):
+        L.append(f"## {prof}\n")
+        L.append("| cap | system | trades | mean R | hit | PF | SR ann | R per year | worst month | max DD (R) | mix |\n|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+        for cap in (5, 10, 20, 999):
+            for ver, fn in (("v2", f"sim_{prof}_v2.csv"), ("v3", f"sim_{prof}_v3.csv")):
+                tr = cap_run(pd.read_csv(OUT / fn), cap)
+                for split, d in (("all", tr), ("test", tr[tr.date >= SPLIT])):
+                    s = stats(d)
+                    L.append(f"| {cap if cap < 999 else '∞'} | {ver} {split} | {s['n']:,} | {s['meanR']:+.3f} | {s['hit']:.0%} | {s['pf']:.2f} | "
+                             f"{s['sr_ann']:+.2f} | {s['R_yr']:+.1f} | {s['worst']:+.1f} | {s['dd']:+.1f} | {s['mix']} |")
+        L.append("")
+    (OUT / "phase3_slot_cap.md").write_text("\n".join(L))
+    print("\n".join(L))
