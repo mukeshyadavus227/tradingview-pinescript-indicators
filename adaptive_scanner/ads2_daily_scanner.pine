@@ -2,10 +2,11 @@
 // © mukeshyadavus
 
 //@version=6
-indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
+// max_labels_count: v2.3.0 draws the deploy markers as labels (see DEPLOY MARKERS below).
+indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true, max_labels_count = 500)
 
 // ============================================================================
-// ADAPTIVE DAILY SCANNER  v2.2.0  (2026-10-24)  — Pine Screener edition, 1D close
+// ADAPTIVE DAILY SCANNER  v2.3.0  (2026-11-06)  — Pine Screener edition, 1D close
 //
 // LINEAGE
 //   Portfolio Scanner v5 [CODEX] → Adaptive Swing Scanner v1.0 (4H, 2026-05-16)
@@ -76,12 +77,36 @@ indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
 //       inside the Screener the sector falls back to the benchmark and the
 //       column prints blank. Breadth, the earnings estimate and the quarterly
 //       acceleration columns DO populate in the Screener.
+//       (Superseded by v2.3.0: the sector is now keyed on the ticker.)
 //     - Breadth: INDEX:S5FI / S5TH (% of S&P 500 above 50D / 200D). Columns +
 //       dashboard, no gate. Mkt Regime keeps the CLS v3 encoding.
 //     - Quarterly acceleration: EPS / revenue FQ series → YoY growth of the last
 //       three quarters, acceleration code (0-2) and the CAN SLIM "C" count
 //       (quarters ≥ 25%). Columns + dashboard; optional growth gate, OFF.
 //     Nothing new gates a deploy by default. Validate first, then gate.
+//   • v2.2.1: dashboard footprint is user-controlled — "Chart: dashboard text
+//     size" (compact default · normal · large) and "Chart: dashboard context
+//     rows" (OFF = 12 decision rows instead of 18).
+//   • v2.3.0 (from the 2026-11-06 Screener export: BKNG MOS DUOL PRU XYZ):
+//     - SECTOR, root cause: the lookup was keyed on syminfo.sector, which the
+//       Screener leaves empty, so every row fell through to the benchmark (Sector
+//       ETF 0, Sector Trend / Sector RS blank, Data OK 64 clear). Now keyed on
+//       syminfo.ticker against the full holdings of the ten Select Sector SPDRs
+//       (473 names, 2026-10-08), with syminfo.industry / syminfo.sector as a
+//       chart-only fallback. Unknown = code 0 with Sector Trend and Sector RS na,
+//       which fails every Screener filter; Sector Trend 0 always means a KNOWN
+//       sector below its 200D. REITs are unknown (no XLRE code), no longer XLF.
+//     - DEPLOY COLUMNS, root cause: "Swing / Positional / Growth deploy" were the
+//       chart-marker plotshapes. They were suppressed on the forming bar and drawn
+//       for the Horizon lane only, while Lanes Deploy reports the last CLOSED bar,
+//       so a scan run before the close showed 0 beside Lanes Deploy = 1. They are
+//       now plain columns equal to the Lanes Deploy bits, the markers are labels
+//       (same triangle, same bar, invisible to the Screener), and Data OK bit 256
+//       asserts bits = columns = (Bars Since Deploy == 0) = Horizon lane.
+//     - SWING STRUCTURE GATE, default OFF, UNVALIDATED: "Require close > SMA200"
+//       plus "Min GR Trend Template score" (3) block S3 MOM and S4 MTF swing deploys
+//       that lack structure. S1 MR is exempt: its trend gate (18) already requires
+//       close > SMA200. Nothing changes until the switch is turned on.
 //
 // PINE SCREENER CONSTRAINTS HONOURED
 //   • request.*() calls: weekly tuple (1) + benchmark (1) + financials 1Y (2) +
@@ -93,13 +118,22 @@ indicator("Adaptive Daily Scanner v2", "ADS2", overlay = true)
 //   • Column titles avoid < and >: the Screener HTML-escapes them in headers.
 //   • First S&P 500 scan (2026-10-23, 503 names): compiled clean, request.financial
 //     populated, benchmark regime populated, 68 deploys (16 growth, 52 swing/S3).
+//   • syminfo.sector / syminfo.industry are empty in the Screener; syminfo.ticker is
+//     not. Anything the Screener must classify is keyed on the ticker (v2.3).
+//   • 64-output limit: 55 columns + 3 SMAs + 5 filters = 63 (v2.3: the deploy
+//     markers moved to labels, which do not count, and the 3 deploy columns took
+//     their slots).
 //
 // COLUMN CODES
 //   Horizon     0 none · 1 SWING · 2 POSITIONAL · 3 GROWTH
 //   Strategy    1 MR (S1) · 3 MOM (S3) · 4 MTF (S4) · 5 PB50 · 6 RECLAIM50 · 7 BASE100
 //   Lanes bits  1 swing deploy · 2 positional deploy · 4 growth deploy
+//               (the Swing / Positional / Growth deploy columns are these bits, 0/1)
 //   Data OK     1 warm-up done · 2 benchmark ok · 4 fundamentals ok · 8 earnings date ok · 16 chart is 1D
-//               · 32 earnings date estimated from cadence · 64 sector ETF ok · 128 breadth ok
+//               · 32 earnings date estimated from cadence · 64 sector data ok (code known, trend and RS
+//               populated) · 128 breadth ok · 256 deploy columns consistent (v2.3; clear = mismatch,
+//               so "Data OK >= 256" keeps only consistent rows) · 512 syminfo.sector supplied (chart)
+//   Sector ETF  0 UNKNOWN · 1 XLK · 2 XLF · 3 XLV · 4 XLP · 5 XLY · 6 XLI · 7 XLE · 8 XLB · 9 XLU · 10 XLC
 //   Regime      0 NEUTRAL · 1 MEAN_REV · 2 BREAKOUT · 3 MOMENTUM · 4 TRENDING (metadata only)
 // ============================================================================
 
@@ -131,6 +165,12 @@ sw_mktMin     = input.int(0, "SWING · min benchmark regime (0-2)", display = di
      tooltip = "0 = no market gate (mean reversion does not want one). 1 = benchmark above its 200D. 2 = above 200D with rising 50D.")
 sw_cool       = input.int(10, "SWING · cooldown bars after a deploy (0 = off)", display = display.none, minval = 0, maxval = 60, group = "Swing lane",
      tooltip = "One signal per setup. S3 stays true for up to 5 bars after a cross; without a cooldown the chart stacks a marker on each of them. 10 bars = two weeks. The Bars Since Deploy column still shows the age of the last signal.")
+// v2.3.0 swing structure gate. Default OFF = v2.2.1 behaviour. UNVALIDATED as a deploy gate:
+// see CHANGELOG (ADS2 2.3.0) for the harness comparison before turning it on.
+sw_structOn   = input.bool(false, "Require close > SMA200", display = display.none, group = "Swing lane",
+     tooltip = "Structure gate, default OFF. ON: an S3 MOM or S4 MTF swing deploy also needs close > SMA200 AND GR Trend Template >= the minimum below. S1 MR is not gated (its trend gate already requires close > SMA200 at the default 18). A blocked setup shows STRUCTURE in the SWING row.")
+sw_structMinTT = input.int(3, "Min GR Trend Template score", display = display.none, minval = 0, maxval = 5, group = "Swing lane",
+     tooltip = "Used only when 'Require close > SMA200' is ON. Same 0-5 count as the GR Trend Template column: price > 50D > 150D > 200D, 200D rising a month, >= 25% above the 52-week low, within 25% of the 52-week high, weekly 20 > 50 EMA.")
 
 po_s4Gate     = input.float(75.0, "POSITIONAL · S4 score gate", display = display.none, minval = 0.0, maxval = 95.0, step = 1.0, group = "Positional lane")
 po_stopMult   = input.float(2.75, "POSITIONAL · ATR stop multiple (ASR profile 2.75)", display = display.none, minval = 1.0, maxval = 6.0, step = 0.25, group = "Positional lane",
@@ -196,6 +236,10 @@ showShapes    = input.bool(true, "Chart: deploy markers", display = display.none
 showDash      = input.bool(true, "Chart: dashboard", display = display.none, group = "Display")
 dashPos       = input.string("top_right", "Chart: dashboard position", display = display.none, options = ["top_right", "top_left", "middle_right", "middle_left", "bottom_right", "bottom_left"], group = "Display",
      tooltip = "Move it when another indicator's table (v1.0, CLS) already sits top-right.")
+dashSize      = input.string("compact", "Chart: dashboard text size", display = display.none, options = ["compact", "normal", "large"], group = "Display",
+     tooltip = "compact = small headers, tiny text (about half the footprint of normal). normal = the v2.1 look. large = for 4K screens or screenshots.")
+showContext   = input.bool(true, "Chart: dashboard context rows (RSI, 52wk, Market, Fund / Earn, Sector / Breadth, Cooldown)", display = display.none, group = "Display",
+     tooltip = "OFF keeps only the decision rows: strategies, lanes, winner, risk, reference position. Cooldown state still shows in the lane rows as COOLDOWN n.")
 levelBars     = input.int(20, "Chart: level line length (bars)", display = display.none, minval = 5, maxval = 60, group = "Display")
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
@@ -293,40 +337,138 @@ revAccel = f_accel(revG0, revG1, revG2)
 epsBigQ  = (nz(epsG0) >= 25.0 ? 1.0 : 0.0) + (nz(epsG1) >= 25.0 ? 1.0 : 0.0) + (nz(epsG2) >= 25.0 ? 1.0 : 0.0)   // CAN SLIM "C": quarters ≥ 25%
 accelOk  = nz(epsAccel) >= 1.0
 
-// ── Sector ETF: RS vs the symbol's own sector (request #7; v2.2) ───────────
-// TradingView sectors (syminfo.sector) mapped to the SPDR that holds them.
-// REITs sit in "Finance" here; Industrial Services holds oilfield services.
-// CHART ONLY: the Pine Screener does not supply syminfo.sector (verified
-// 2026-10-24), so there the switch falls to the benchmark and secOk is false.
-secSym = switch syminfo.sector
-    "Technology Services"    => "AMEX:XLK"
-    "Electronic Technology"  => "AMEX:XLK"
-    "Finance"                => "AMEX:XLF"
-    "Health Technology"      => "AMEX:XLV"
-    "Health Services"        => "AMEX:XLV"
-    "Consumer Non-Durables"  => "AMEX:XLP"
-    "Consumer Durables"      => "AMEX:XLY"
-    "Consumer Services"      => "AMEX:XLY"
-    "Retail Trade"           => "AMEX:XLY"
-    "Producer Manufacturing" => "AMEX:XLI"
-    "Industrial Services"    => "AMEX:XLI"
-    "Transportation"         => "AMEX:XLI"
-    "Commercial Services"    => "AMEX:XLI"
-    "Distribution Services"  => "AMEX:XLI"
-    "Energy Minerals"        => "AMEX:XLE"
-    "Non-Energy Minerals"    => "AMEX:XLB"
-    "Process Industries"     => "AMEX:XLB"
-    "Utilities"              => "AMEX:XLU"
-    "Communications"         => "AMEX:XLC"
-    => benchSym
+// ── Sector ETF: RS vs the symbol's own sector (request #7; v2.2, re-keyed v2.3.0) ──
+// v2.3.0 ROOT CAUSE: v2.2 keyed this lookup on syminfo.sector. The Pine Screener leaves
+// syminfo.sector empty, so in the Screener the switch always fell through to the
+// benchmark and secOk was false on every row (2026-11-06 export: Sector ETF 0, Sector
+// Trend and Sector RS 3M blank, Data OK bit 64 clear on BKNG MOS DUOL PRU XYZ). The
+// request was never the problem; its key was empty.
+// Resolution order now:
+//   1. syminfo.ticker in the SPDR holdings lists below. syminfo.ticker IS supplied in the
+//      Screener, so this is the path that fixes it. Exact GICS placement for S&P 500 names.
+//   2. Chart only (the Screener has neither field): syminfo.industry overrides, then
+//      syminfo.sector. TradingView/FactSet sectors are not GICS, so a sector-level table
+//      misfiles whole industries (e.g. payments, ratings agencies, A&D, oilfield services,
+//      media); the overrides fix those. Shown with "~" on the dashboard (estimated).
+//   3. Otherwise UNKNOWN: code 0, Sector Trend and Sector RS na, Data OK bit 64 clear.
+// UNKNOWN NEVER PASSES A FILTER: na fails every Screener numeric filter, and Sector Trend 0
+// is only ever emitted for a KNOWN sector that is below its 200D.
+// <sector-map:begin> generated by research/build_sector_map.py from spdr_holdings_2026-10-08.txt — do not edit by hand
+// Full holdings of the ten Select Sector SPDR ETFs, holdings date 2026-10-08 (Zacks Investment
+// Research), 473 US tickers. XLRE has no code here, so REITs resolve to unknown (code 0).
+// XLK: 75
+const string SEC_XLK = "|NVDA|AAPL|MSFT|AMD|AVGO|MU|INTC|CSCO|PLTR|AMAT|LRCX|PANW|CRWD|TXN|KLAC|MRVL|" +
+     "ORCL|SNDK|ANET|APH|IBM|ADI|QCOM|CRM|STX|DELL|WDC|NOW|GLW|ACN|FTNT|LITE|CDNS|" +
+     "SNPS|HPE|ADBE|DDOG|INTU|MSI|MPWR|COHR|KEYS|TER|CIEN|TEL|NXPI|P|ADSK|NTAP|FLEX|" +
+     "MCHP|WDAY|ROP|ON|JBL|HPQ|TWLO|TDY|Q|FFIV|CTSH|SMCI|VRSN|PTC|FSLR|SWKS|ZBRA|CDW|" +
+     "AKAM|FICO|TRMB|TYL|GDDY|GEN|IT|"
+// XLF: 76
+const string SEC_XLF = "|BRK.B|JPM|V|MA|BAC|GS|WFC|MS|C|AXP|SCHW|BLK|PGR|COF|SPGI|CB|CME|BNY|USB|PNC|" +
+     "HOOD|ICE|BX|MRSH|TRV|MCO|KKR|AJG|AON|ALL|TFC|APO|MET|AFL|STT|PYPL|FITB|AMP|XYZ|" +
+     "NDAQ|MSCI|COIN|IBKR|AIG|PRU|HIG|ACGL|MTB|NTRS|HBAN|CBOE|RJF|WTW|CFG|CPAY|ARES|" +
+     "CINF|FISV|SYF|RF|TROW|PFG|GPN|KEY|BRO|L|FIS|WRB|IVZ|AIZ|EG|GL|JKHY|FDS|BEN|" +
+     "ERIE|"
+// XLV: 60
+const string SEC_XLV = "|LLY|JNJ|ABBV|MRK|UNH|TMO|AMGN|GILD|ABT|PFE|ISRG|DHR|VRTX|BMY|CVS|MDT|MCK|SYK|" +
+     "ELV|CI|MRNA|REGN|HCA|COR|BSX|CAH|EW|BDX|A|HUM|WAT|IQV|VEEV|ILMN|IDXX|BIIB|RMD|" +
+     "CNC|DXCM|MTD|ZTS|GEHC|WST|LH|DGX|STE|VTRS|INCY|RVTY|ZBH|CRL|SOLV|BAX|TECH|COO|" +
+     "PODD|ALGN|UHS|HSIC|DVA|"
+// XLP: 34
+const string SEC_XLP = "|WMT|COST|PG|KO|PM|MO|CL|TGT|MDLZ|PEP|MNST|KDP|ADM|SYY|KR|KVUE|KMB|DG|VYLR|HSY|" +
+     "CASY|EL|CHD|DLTR|KHC|STZ|GIS|BG|TSN|SJM|MKC|CLX|HRL|BF.B|"
+// XLY: 47
+const string SEC_XLY = "|AMZN|TSLA|HD|TJX|MCD|BKNG|SBUX|LOW|MAR|ROST|HLT|DASH|GM|RCL|ORLY|ABNB|F|AZO|" +
+     "GRMN|CVNA|EBAY|NKE|CMG|YUM|DHI|CCL|EXPE|WSM|ULTA|DRI|TPR|PHM|GPC|TSCO|BBY|NVR|" +
+     "LEN|RL|HAS|DECK|DPZ|LULU|LVS|APTV|NCLH|WYNN|MGM|"
+// XLI: 83
+const string SEC_XLI = "|CAT|GE|GEV|RTX|ETN|DE|UNP|BA|UBER|PH|PWR|ADP|TT|LMT|VRT|JCI|HWM|EMR|CSX|BE|MMM|" +
+     "GD|WM|CMI|NSC|UPS|CTAS|ITW|HON|URI|FDX|NOC|FIX|TDG|FAST|AME|PCAR|GWW|DAL|ROK|" +
+     "HONA|WAB|CARR|LHX|RSG|FERG|UAL|EME|AXON|ODFL|PAYX|IR|DOV|HUBB|OTIS|EXPD|XYL|" +
+     "VLTO|CPRT|VRSK|LUV|SNA|BR|DD|NDSN|IEX|FTV|EFX|JBHT|J|CHRW|LDOS|MAS|FDXF|SWK|" +
+     "GNRC|ALLE|TXT|LII|HII|ROL|PNR|AOS|"
+// XLE: 21
+const string SEC_XLE = "|XOM|CVX|COP|MPC|VLO|PSX|WMB|EOG|SLB|KMI|TRGP|OKE|BKR|DVN|OXY|FANG|EQT|HAL|EXE|" +
+     "TPL|APA|"
+// XLB: 24
+const string SEC_XLB = "|LIN|NEM|FCX|ECL|SHW|VMC|STLD|NUE|MLM|APD|CRH|PPG|SW|IFF|PKG|DOW|AMCR|CF|IP|" +
+     "BALL|LYB|AVY|ALB|MOS|"
+// XLU: 31
+const string SEC_XLU = "|NEE|CEG|SO|DUK|AEP|D|VST|SRE|ETR|XEL|EXC|ED|PEG|WEC|PCG|AEE|ATO|DTE|PPL|CNP|" +
+     "AWK|ES|FE|NRG|EIX|CMS|NI|EVRG|LNT|PNW|AES|"
+// XLC: 22
+const string SEC_XLC = "|META|GOOGL|GOOG|DIS|T|TTWO|TMUS|APP|VZ|NFLX|CMCSA|LYV|RDDT|OMC|ECHO|FOXA|CHTR|" +
+     "TKO|NWSA|FOX|SKYD|NWS|"
+// <sector-map:end>
+f_inSec(simple string lst) => str.contains(lst, "|" + syminfo.ticker + "|")
+secCodeList = f_inSec(SEC_XLK) ? 1 : f_inSec(SEC_XLF) ? 2 : f_inSec(SEC_XLV) ? 3 : f_inSec(SEC_XLP) ? 4 : f_inSec(SEC_XLY) ? 5 : f_inSec(SEC_XLI) ? 6 : f_inSec(SEC_XLE) ? 7 : f_inSec(SEC_XLB) ? 8 : f_inSec(SEC_XLU) ? 9 : f_inSec(SEC_XLC) ? 10 : 0
+// Chart-only fallback. Industry first: -1 = known to belong to a sector with no code here
+// (real estate → XLRE), 0 = no override. Strings verified against TradingView 2026-11-06.
+secCodeInd = switch syminfo.industry
+    "Real Estate Investment Trusts"     => -1
+    "Real Estate Development"           => -1
+    "Oilfield Services/Equipment"       => 7
+    "Contract Drilling"                 => 7
+    "Oil & Gas Pipelines"               => 7
+    "Aerospace & Defense"               => 6
+    "Apparel/Footwear"                  => 5
+    "Movies/Entertainment"              => 10
+    "Broadcasting"                      => 10
+    "Cable/Satellite TV"                => 10
+    "Advertising/Marketing Services"    => 10
+    "Medical Distributors"              => 3
+    "Food Distributors"                 => 4
+    "Food Retail"                       => 4
+    "Discount Stores"                   => 4
+    "Agricultural Commodities/Milling"  => 4
+    "Financial Publishing/Services"     => 2
+    "Miscellaneous Commercial Services" => 2
+    => 0
+// v2.2 sector table, unchanged (Commercial Services → XLI is right for CTAS / ROL / EFX only).
+secCodeSec = switch syminfo.sector
+    "Technology Services"    => 1
+    "Electronic Technology"  => 1
+    "Finance"                => 2
+    "Health Technology"      => 3
+    "Health Services"        => 3
+    "Consumer Non-Durables"  => 4
+    "Consumer Durables"      => 5
+    "Consumer Services"      => 5
+    "Retail Trade"           => 5
+    "Producer Manufacturing" => 6
+    "Industrial Services"    => 6
+    "Transportation"         => 6
+    "Commercial Services"    => 6
+    "Distribution Services"  => 6
+    "Energy Minerals"        => 7
+    "Non-Energy Minerals"    => 8
+    "Process Industries"     => 8
+    "Utilities"              => 9
+    "Communications"         => 10
+    => 0
+secCodeFb = secCodeInd != 0 ? math.max(secCodeInd, 0) : secCodeSec
+secCode   = secCodeList > 0 ? secCodeList : secCodeFb
+secSrc    = secCodeList > 0 ? 1 : secCodeFb > 0 ? 2 : 0      // 1 SPDR list · 2 syminfo estimate (chart) · 0 unknown
+secKnown  = secCode > 0
+secNameOk = nz(str.length(syminfo.sector)) > 0               // diagnostic only: Data OK bit 512
+secSym = switch secCode
+    1  => "AMEX:XLK"
+    2  => "AMEX:XLF"
+    3  => "AMEX:XLV"
+    4  => "AMEX:XLP"
+    5  => "AMEX:XLY"
+    6  => "AMEX:XLI"
+    7  => "AMEX:XLE"
+    8  => "AMEX:XLB"
+    9  => "AMEX:XLU"
+    10 => "AMEX:XLC"
+    => benchSym   // keeps the request well-formed for an unknown sector; its data is never used (secKnown false)
 secClose  = request.security(secSym, timeframe.period, close, ignore_invalid_symbol = true)
-secOk     = not na(secClose) and secSym != benchSym
 secSma50  = ta.sma(secClose, 50)
 secSma200 = ta.sma(secClose, 200)
-secTrend  = not secOk or na(secSma200) ? na : secClose > secSma200 ? (secSma50 > secSma50[10] ? 2.0 : 1.0) : 0.0
-rsSec3m   = secOk and close[63] > 0 and secClose[63] > 0 ? ((close / close[63]) / (secClose / secClose[63]) - 1.0) * 100.0 : na
-secCode   = secSym == "AMEX:XLK" ? 1.0 : secSym == "AMEX:XLF" ? 2.0 : secSym == "AMEX:XLV" ? 3.0 : secSym == "AMEX:XLP" ? 4.0 : secSym == "AMEX:XLY" ? 5.0 : secSym == "AMEX:XLI" ? 6.0 : secSym == "AMEX:XLE" ? 7.0 : secSym == "AMEX:XLB" ? 8.0 : secSym == "AMEX:XLU" ? 9.0 : secSym == "AMEX:XLC" ? 10.0 : 0.0
-secTag    = str.replace(secSym, "AMEX:", "", 0)
+secTrend  = not secKnown or na(secClose) or na(secSma200) ? na : secClose > secSma200 ? (secSma50 > secSma50[10] ? 2.0 : 1.0) : 0.0
+rsSec3m   = secKnown and close[63] > 0 and secClose[63] > 0 ? ((close / close[63]) / (secClose / secClose[63]) - 1.0) * 100.0 : na
+secOk     = secKnown and not na(secTrend) and not na(rsSec3m)   // Data OK bit 64: code known AND both sector columns populated
+secTag    = secKnown ? str.replace(secSym, "AMEX:", "", 0) + (secSrc == 2 ? "~" : "") : "?"
 
 // ── Breadth: % of S&P 500 above its 50D / 200D (requests #8, #9; v2.2) ─────
 s5fi = request.security("INDEX:S5FI", "1D", close, ignore_invalid_symbol = true)
@@ -475,6 +617,13 @@ s4_elig = s4_trig and s4_score >= sw_s4Gate
 swStrat = s1_elig ? 1 : s4_elig ? 4 : s3_elig ? 3 : 0
 swScore = swStrat == 1 ? s1_score : swStrat == 4 ? s4_score : swStrat == 3 ? s3_score : 0.0
 swTrig  = swStrat > 0
+// v2.3.0 swing structure gate (input "Require close > SMA200"; default OFF = v2.2.1).
+// A deploy gate like the earnings and market gates: the trigger, its score and its
+// "Bars Since Trigger" stay as they were; only the deploy is withheld. S3 MOM and S4 MTF
+// only. S1 MR is exempt because its trend gate (18 = above SMA200) already enforces
+// close > SMA200, and the change request protects MR. S3 and S4 share one condition,
+// so a blocked S4 can never fall back to S3.
+swStructOk = not sw_structOn or swStrat == 1 or (aboveLT and gr_ttCount >= sw_structMinTT)
 
 // Swing geometry (ASR SWING profile, stopScale = 1)
 swStopD  = swStrat == 1 ? atr * 1.2 : swStrat == 3 ? atr * 1.8 : atr * 2.5
@@ -516,7 +665,7 @@ swCoolOk = sw_cool <= 0 or na(swDepBar) or bar_index - swDepBar > sw_cool
 poCoolOk = po_cool <= 0 or na(poDepBar) or bar_index - poDepBar > po_cool
 grCoolOk = gr_cool <= 0 or na(grDepBar) or bar_index - grDepBar > gr_cool
 
-swDeploy = warmOk and swTrig and liqOk and swR >= minRR and f_earnOk(sw_earnDays) and f_mktOk(sw_mktMin) and swCoolOk
+swDeploy = warmOk and swTrig and liqOk and swR >= minRR and f_earnOk(sw_earnDays) and f_mktOk(sw_mktMin) and swStructOk and swCoolOk
 poDeploy = warmOk and po_elig and liqOk and poR >= minRR and f_earnOk(po_earnDays) and f_mktOk(po_mktMin) and poCoolOk
 grDeploy = warmOk and gr_trig and gr_score >= gr_gate and liqOk and (not gr_requireFund or fundOk) and (not gr_requireAccel or accelOk) and not na(grRiskPct) and grRiskPct <= gr_maxRisk and f_earnOk(gr_earnDays) and f_mktOk(gr_mktMin) and grCoolOk
 
@@ -603,6 +752,8 @@ grMktO     = ob(f_mktOk(gr_mktMin))
 swCoolO    = ob(swCoolOk)
 poCoolO    = ob(poCoolOk)
 grCoolO    = ob(grCoolOk)
+swStructO  = ob(swStructOk)   // v2.3.0
+aboveLTO   = ob(aboveLT)      // v2.3.0
 
 swScoreO   = o(swScore)
 swStratO   = o(swStrat)
@@ -666,14 +817,34 @@ tpPx      = horizon == 2 ? poTpO : horizon == 1 ? swTpO : na
 riskPct   = horizon == 3 ? grRiskO : horizon == 2 ? poRiskO : horizon == 1 ? swRiskO : na
 rMult     = horizon == 2 ? poRO : horizon == 1 ? swRO : na
 anyTrigToday = (swTrigO or poEligO or grTrigO) and warmO
-dataBits  = (warmO ? 1 : 0) + (benchO ? 2 : 0) + (fundO ? 4 : 0) + (earnKnownO ? 8 : 0) + (isDailyTF ? 16 : 0) + (earnEstO ? 32 : 0) + (secOkO ? 64 : 0) + (breadthO ? 128 : 0)
+
+// v2.3.0 deploy columns + consistency assertion (Data OK bit 256).
+// The Swing / Positional / Growth deploy columns are the Lanes Deploy bits, 0/1. The check
+// compares three paths per lane: the bit (decoded back out of lanesBits; Pine has no bitwise
+// operators), the column, and "Bars Since Deploy == 0", which comes from the persistent
+// deploy-bar state (swDepBar …) rather than from ob(), so a disagreement between the
+// closed-bar offset and the lane state shows up. Horizon's lane bit must also be set.
+// Bit 256 clear = mismatch; every bit below 256 sums to at most 255, so a Screener filter
+// "Data OK >= 256" keeps exactly the consistent rows.
+colSw = swD ? 1 : 0
+colPo = poD ? 1 : 0
+colGr = grD ? 1 : 0
+bitSw = lanesBits % 2 == 1
+bitPo = math.floor(lanesBits / 2) % 2 == 1
+bitGr = math.floor(lanesBits / 4) % 2 == 1
+horLaneOk = horizon == 0 or (horizon == 1 and bitSw) or (horizon == 2 and bitPo) or (horizon == 3 and bitGr)
+deployOk  = bitSw == (colSw == 1) and bitPo == (colPo == 1) and bitGr == (colGr == 1) and
+     bitSw == (nz(swBarsDep, -1.0) == 0.0) and bitPo == (nz(poBarsDep, -1.0) == 0.0) and bitGr == (nz(grBarsDep, -1.0) == 0.0) and horLaneOk
+dataBits  = (warmO ? 1 : 0) + (benchO ? 2 : 0) + (fundO ? 4 : 0) + (earnKnownO ? 8 : 0) + (isDailyTF ? 16 : 0) + (earnEstO ? 32 : 0) + (secOkO ? 64 : 0) + (breadthO ? 128 : 0) +
+     (deployOk ? 256 : 0) + (secNameOk ? 512 : 0)
 
 // Block reasons: the one gate responsible, named (never a bare "no trigger"
 // when a strategy did trigger and lost to its score gate).
 f_n(float v) => str.tostring(v, "#")
 earnTxt = earnKnownO ? "EARNINGS " + f_n(dteO) + "d" : earnEstO ? "EARNINGS ~" + f_n(dteO) + "d est" : "EARNINGS"
 swTrigWhy = s4TrigO ? "S4 " + f_n(s4ScoreO) + "<" + f_n(sw_s4Gate) : s3TrigO ? "S3 " + f_n(s3ScoreO) + "<" + f_n(sw_s3Gate) : s1TrigO ? "S1 trend " + f_n(s1TrendO) + "<" + f_n(sw_s1Gate) : "no trigger"
-blockSw = not warmO ? "WARMUP" : not swTrigO ? swTrigWhy : not liqO ? "LIQUIDITY" : swRO < minRR ? "R:R " + str.tostring(swRO, "0.0") : not swEarnO ? earnTxt : not swMktO ? "MKT REGIME" : not swCoolO ? "COOLDOWN " + f_n(swCoolRem) : "DEPLOY"
+structTxt = aboveLTO ? "STRUCTURE tt " + f_n(grTtO) + "<" + str.tostring(sw_structMinTT) : "STRUCTURE <200D"   // v2.3.0
+blockSw = not warmO ? "WARMUP" : not swTrigO ? swTrigWhy : not liqO ? "LIQUIDITY" : swRO < minRR ? "R:R " + str.tostring(swRO, "0.0") : not swEarnO ? earnTxt : not swMktO ? "MKT REGIME" : not swStructO ? structTxt : not swCoolO ? "COOLDOWN " + f_n(swCoolRem) : "DEPLOY"
 blockPo = not warmO ? "WARMUP" : not poEligO ? (s4TrigO ? "S4 " + f_n(s4ScoreO) + "<" + f_n(po_s4Gate) : "no trigger") : not liqO ? "LIQUIDITY" : poRO < minRR ? "R:R " + str.tostring(poRO, "0.0") : not poEarnO ? earnTxt : not poMktO ? "MKT REGIME" : not poCoolO ? "COOLDOWN " + f_n(poCoolRem) : "DEPLOY"
 blockGr = not warmO ? "WARMUP" : not grTrigO ? "no trigger" : grScoreO < gr_gate ? "score " + f_n(grScoreO) + "<" + f_n(gr_gate) : not liqO ? "LIQUIDITY" : (gr_requireFund and not fundO) ? "NO FUND DATA" : (gr_requireAccel and not accelOkO) ? "NO EPS ACCEL" : (na(grRiskO) or grRiskO > gr_maxRisk) ? "RISK " + str.tostring(grRiskO, "0.#") + "%>" + f_n(gr_maxRisk) : not grEarnO ? earnTxt : not grMktO ? "MKT REGIME" : not grCoolO ? "COOLDOWN " + f_n(grCoolRem) : "DEPLOY"
 
@@ -727,7 +898,7 @@ plot(rsiO,              "RSI 14",                                              d
 plot(regimeO,           "Regime (0 N 1 MR 2 BO 3 MOM 4 TR)",                   display = colDisp)
 // ── v2.2: earnings estimate, sector, breadth, quarterly acceleration ──
 plot(dteEstO,           "Days to Earnings Est (cadence)",                      display = colDisp)
-plot(secCode,           "Sector ETF (1 XLK 2 XLF 3 XLV 4 XLP 5 XLY 6 XLI 7 XLE 8 XLB 9 XLU 10 XLC)", display = colDisp)
+plot(secCode,           "Sector ETF (0 unknown 1 XLK 2 XLF 3 XLV 4 XLP 5 XLY 6 XLI 7 XLE 8 XLB 9 XLU 10 XLC)", display = colDisp)
 plot(rsSecO,            "Sector RS 3M %",                                      display = colDisp)
 plot(secTrendO,         "Sector Trend (0 below 200D, 1 above, 2 above + rising 50D)", display = colDisp)
 plot(s5fiO,             "Breadth Pct Above 50D (S5FI)",                        display = colDisp)
@@ -737,7 +908,12 @@ plot(epsAccelO,         "EPS Accel (0-2 rising quarters)",                     d
 plot(epsBigQO,          "EPS Quarters 25pct Plus (0-3)",                       display = colDisp)
 plot(revG0O,            "Rev YoY Latest Q %",                                  display = colDisp)
 plot(revAccelO,         "Rev Accel (0-2 rising quarters)",                     display = colDisp)
-plot(dataBits,          "Data OK (bits 1 warm 2 bench 4 fund 8 earn 16 1D 32 earn est 64 sector 128 breadth)", display = colDisp)
+plot(dataBits,          "Data OK (bits 1 warm 2 bench 4 fund 8 earn 16 1D 32 earn est 64 sector 128 breadth 256 deploy check 512 syminfo sector)", display = colDisp)
+// ── v2.3.0: deploy flags as plain columns, equal to the Lanes Deploy bits (asserted by Data OK bit 256).
+// Same titles as the v2.2 marker plotshapes they replace, so a saved column choice keeps its name.
+plot(colSw,             "Swing deploy",                                        display = colDisp)
+plot(colPo,             "Positional deploy",                                   display = colDisp)
+plot(colGr,             "Growth deploy",                                       display = colDisp)
 
 // ── boolean filters ──
 alertcondition(swD, "ADS2 Swing deploy", "ADS2 swing deploy on {{ticker}}")
@@ -856,7 +1032,7 @@ if previewOk
 // A lane that passed every gate EXCEPT the earnings blackout is exactly what the
 // Screener reports as a deploy. Draw its levels in grey on the last closed bar
 // with the reason, so a Screener row never looks like a missing drawing.
-swBlkE  = warmO and swTrigO and liqO and swRO >= minRR and not swEarnO and swMktO and swCoolO
+swBlkE  = warmO and swTrigO and liqO and swRO >= minRR and not swEarnO and swMktO and swStructO and swCoolO   // v2.3.0: + structure gate
 poBlkE  = warmO and poEligO and liqO and poRO >= minRR and not poEarnO and poMktO and poCoolO
 grBlkE  = warmO and grTrigO and grScoreO >= gr_gate and liqO and (not gr_requireFund or fundO) and (not gr_requireAccel or accelOkO) and not na(grRiskO) and grRiskO <= gr_maxRisk and not grEarnO and grMktO and grCoolO
 blkLane = horizon > 0 ? 0 : grBlkE ? 3 : (poBlkE and poStructO >= po_minStruct) ? 2 : swBlkE ? 1 : 0
@@ -908,107 +1084,118 @@ plot(showLines ? sma50 : na,  "SMA 50",  color = color.new(color.blue, 40),   di
 plot(showLines ? sma150 : na, "SMA 150", color = color.new(color.orange, 55), display = display.pane)
 plot(showLines ? sma200 : na, "SMA 200", color = color.new(color.gray, 30),   display = display.pane)
 
-// One marker per bar, the Horizon lane only; never on the forming bar in closed-bar mode.
+// DEPLOY MARKERS. One marker per bar, the Horizon lane only; never on the forming bar in
+// closed-bar mode (unchanged rules).
+// v2.3.0: drawn as labels, not plotshape(). Every plot is a Screener column, so the three
+// marker plotshapes WERE the "Swing / Positional / Growth deploy" columns — evaluated on the
+// forming bar (where the marker is suppressed, so 0) and for the Horizon lane only — and read
+// 0 beside "Lanes Deploy" = 1 (2026-11-06 export). A label draws the same triangle on the same
+// bar and never reaches the Screener; the columns are now the bits (see SCREENER COLUMNS).
+// Output budget: Pine counts plot(), plotshape() and alertcondition() against one 64-output
+// limit: 55 columns + 3 SMAs + 5 filters = 63. Labels do not count.
 mk = showShapes and horizon > 0 and not (useClosedOnly and forming)
-// Pine counts plot(), plotshape() and alertcondition() against one 64-output
-// limit: 52 columns + 3 SMAs + 3 markers + 5 filters = 63. The S/P/G letter
-// variant of the markers was dropped in v2.2 to stay under it.
-plotshape(mk and horizon == 1, "Swing deploy", shape.triangleup, location.belowbar, color.green, size = size.small, display = display.pane)
-plotshape(mk and horizon == 2, "Positional deploy", shape.triangleup, location.belowbar, color.teal, size = size.small, display = display.pane)
-plotshape(mk and horizon == 3, "Growth deploy", shape.triangleup, location.belowbar, color.purple, size = size.small, display = display.pane)
+if mk
+    label.new(bar_index, low, "", yloc = yloc.belowbar, color = horizon == 3 ? color.purple : horizon == 2 ? color.teal : color.green, style = label.style_triangleup, size = size.small)
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║ DASHBOARD (v1.0 layout: strategy rows → winner → risk → position → context)║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-var table tbl = table.new(dashPos, 4, 18, border_color = color.gray, border_width = 1, frame_color = color.gray, frame_width = 2)
+// Text sizes by the dashboard size input (table text_size takes a series string).
+szHdr = dashSize == "compact" ? size.small : dashSize == "large" ? size.large : size.normal
+szLbl = dashSize == "compact" ? size.tiny : dashSize == "large" ? size.normal : size.small
+szVal = dashSize == "large" ? size.small : size.tiny
+var table tbl = table.new(dashPos, 4, showContext ? 18 : 12, border_color = color.gray, border_width = 1, frame_color = color.gray, frame_width = dashSize == "compact" ? 1 : 2)
 if barstate.islast and showDash
     okC = color.green
     noC = color.gray
     wC  = color.white
     hdrBg = color.navy
     // header
-    table.cell(tbl, 0, 0, syminfo.ticker, bgcolor = color.black, text_color = wC, text_size = size.normal)
-    table.cell(tbl, 1, 0, timeframe.period + (off == 1 ? " prev" : ""), bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 2, 0, "Score", bgcolor = color.black, text_color = wC, text_size = size.small)
-    table.cell(tbl, 3, 0, "Status", bgcolor = color.black, text_color = wC, text_size = size.small)
+    table.cell(tbl, 0, 0, syminfo.ticker, bgcolor = color.black, text_color = wC, text_size = szHdr)
+    table.cell(tbl, 1, 0, timeframe.period + (off == 1 ? " prev" : ""), bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 2, 0, "Score", bgcolor = color.black, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 3, 0, "Status", bgcolor = color.black, text_color = wC, text_size = szLbl)
     // regime (metadata)
     rgC = regimeO == 4 ? color.green : regimeO == 2 ? color.yellow : regimeO == 3 ? color.blue : regimeO == 1 ? color.purple : color.gray
-    table.cell(tbl, 0, 1, "REGIME", bgcolor = color.maroon, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 1, regLabel, text_color = rgC, text_size = size.small)
-    table.cell(tbl, 2, 1, f_n(regConfO), text_color = rgC, text_size = size.small)
-    table.cell(tbl, 3, 1, "ADX=" + f_n(adxO) + " CH=" + f_n(chopO) + " · metadata", text_color = wC, text_size = size.tiny)
+    table.cell(tbl, 0, 1, "REGIME", bgcolor = color.maroon, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 1, regLabel, text_color = rgC, text_size = szLbl)
+    table.cell(tbl, 2, 1, f_n(regConfO), text_color = rgC, text_size = szLbl)
+    table.cell(tbl, 3, 1, "ADX=" + f_n(adxO) + " CH=" + f_n(chopO) + " · metadata", text_color = wC, text_size = szVal)
     // strategy rows
-    table.cell(tbl, 0, 2, "S1 MeanRev", bgcolor = color.new(color.purple, 50), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 2, s1TrigO ? "TRIG" : "—", text_color = s1TrigO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 2, 2, f_n(s1ScoreO), text_color = s1EligO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 2, s1EligO ? "ELIGIBLE" : s1TrigO ? "trend " + f_n(s1TrendO) + "<" + f_n(sw_s1Gate) : "—", text_color = s1EligO ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 3, "S3 Momentum", bgcolor = color.new(color.blue, 50), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 3, s3TrigO ? "TRIG" : "—", text_color = s3TrigO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 2, 3, f_n(s3ScoreO) + "/" + f_n(sw_s3Gate), text_color = s3EligO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 3, s3EligO ? "ELIGIBLE" : s3TrigO ? "score<gate" : "—", text_color = s3EligO ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 4, "S4 MTF Trend", bgcolor = color.new(color.teal, 50), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 4, s4TrigO ? "TRIG" : "—", text_color = s4TrigO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 2, 4, f_n(s4ScoreO) + "/" + f_n(sw_s4Gate), text_color = s4EligO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 4, s4EligO ? "ELIGIBLE" : s4TrigO ? "score<gate" : "—", text_color = s4EligO ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 5, "GROWTH " + grLabel, bgcolor = color.new(color.purple, 65), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 5, grTrigO ? "TRIG" : "—", text_color = grTrigO ? okC : noC, text_size = size.small)
-    table.cell(tbl, 2, 5, f_n(grScoreO) + "/" + f_n(gr_gate) + " tt " + f_n(grTtO) + "/5", text_color = grTrigO and grScoreO >= gr_gate ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 5, grTrigO ? (grScoreO >= gr_gate ? "ELIGIBLE" : "score<gate") : "—", text_color = grTrigO and grScoreO >= gr_gate ? okC : noC, text_size = size.tiny)
+    table.cell(tbl, 0, 2, "S1 MeanRev", bgcolor = color.new(color.purple, 50), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 2, s1TrigO ? "TRIG" : "—", text_color = s1TrigO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 2, 2, f_n(s1ScoreO), text_color = s1EligO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 2, s1EligO ? "ELIGIBLE" : s1TrigO ? "trend " + f_n(s1TrendO) + "<" + f_n(sw_s1Gate) : "—", text_color = s1EligO ? okC : noC, text_size = szVal)
+    table.cell(tbl, 0, 3, "S3 Momentum", bgcolor = color.new(color.blue, 50), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 3, s3TrigO ? "TRIG" : "—", text_color = s3TrigO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 2, 3, f_n(s3ScoreO) + "/" + f_n(sw_s3Gate), text_color = s3EligO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 3, s3EligO ? "ELIGIBLE" : s3TrigO ? "score<gate" : "—", text_color = s3EligO ? okC : noC, text_size = szVal)
+    table.cell(tbl, 0, 4, "S4 MTF Trend", bgcolor = color.new(color.teal, 50), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 4, s4TrigO ? "TRIG" : "—", text_color = s4TrigO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 2, 4, f_n(s4ScoreO) + "/" + f_n(sw_s4Gate), text_color = s4EligO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 4, s4EligO ? "ELIGIBLE" : s4TrigO ? "score<gate" : "—", text_color = s4EligO ? okC : noC, text_size = szVal)
+    table.cell(tbl, 0, 5, "GROWTH " + grLabel, bgcolor = color.new(color.purple, 65), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 5, grTrigO ? "TRIG" : "—", text_color = grTrigO ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 2, 5, f_n(grScoreO) + "/" + f_n(gr_gate) + " tt " + f_n(grTtO) + "/5", text_color = grTrigO and grScoreO >= gr_gate ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 5, grTrigO ? (grScoreO >= gr_gate ? "ELIGIBLE" : "score<gate") : "—", text_color = grTrigO and grScoreO >= gr_gate ? okC : noC, text_size = szVal)
     // lanes
-    table.cell(tbl, 0, 6, "SWING", bgcolor = color.new(color.green, 70), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 6, swTrigO ? swLabel + " BUY" : "—", text_color = swD ? okC : swTrigO ? color.yellow : noC, text_size = size.small)
-    table.cell(tbl, 2, 6, f_n(swScoreO), text_color = swD ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 6, blockSw, text_color = blockSw == "DEPLOY" ? okC : swTrigO ? color.orange : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 7, "POSITIONAL", bgcolor = color.new(color.teal, 60), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 7, poEligO ? "MTF BUY · str " + f_n(poStructO) + "/5" : "str " + f_n(poStructO) + "/5", text_color = poD ? okC : poEligO ? color.yellow : noC, text_size = size.small)
-    table.cell(tbl, 2, 7, poEligO ? f_n(s4ScoreO) : "0", text_color = poD ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 7, blockPo, text_color = blockPo == "DEPLOY" ? okC : poEligO ? color.orange : noC, text_size = size.tiny)
-    table.cell(tbl, 0, 8, "GROWTH", bgcolor = color.new(color.purple, 50), text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 8, grTrigO ? grLabel + " BUY" : "—", text_color = grD ? okC : grTrigO ? color.yellow : noC, text_size = size.small)
-    table.cell(tbl, 2, 8, f_n(grScoreO), text_color = grD ? okC : noC, text_size = size.small)
-    table.cell(tbl, 3, 8, blockGr, text_color = blockGr == "DEPLOY" ? okC : grTrigO ? color.orange : noC, text_size = size.tiny)
+    table.cell(tbl, 0, 6, "SWING", bgcolor = color.new(color.green, 70), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 6, swTrigO ? swLabel + " BUY" : "—", text_color = swD ? okC : swTrigO ? color.yellow : noC, text_size = szLbl)
+    table.cell(tbl, 2, 6, f_n(swScoreO), text_color = swD ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 6, blockSw, text_color = blockSw == "DEPLOY" ? okC : swTrigO ? color.orange : noC, text_size = szVal)
+    table.cell(tbl, 0, 7, "POSITIONAL", bgcolor = color.new(color.teal, 60), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 7, poEligO ? "MTF BUY · str " + f_n(poStructO) + "/5" : "str " + f_n(poStructO) + "/5", text_color = poD ? okC : poEligO ? color.yellow : noC, text_size = szLbl)
+    table.cell(tbl, 2, 7, poEligO ? f_n(s4ScoreO) : "0", text_color = poD ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 7, blockPo, text_color = blockPo == "DEPLOY" ? okC : poEligO ? color.orange : noC, text_size = szVal)
+    table.cell(tbl, 0, 8, "GROWTH", bgcolor = color.new(color.purple, 50), text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 8, grTrigO ? grLabel + " BUY" : "—", text_color = grD ? okC : grTrigO ? color.yellow : noC, text_size = szLbl)
+    table.cell(tbl, 2, 8, f_n(grScoreO), text_color = grD ? okC : noC, text_size = szLbl)
+    table.cell(tbl, 3, 8, blockGr, text_color = blockGr == "DEPLOY" ? okC : grTrigO ? color.orange : noC, text_size = szVal)
     // winner
-    table.cell(tbl, 0, 9, "WINNER", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 9, horizon > 0 ? horLabel + " " + stratLbl + " BUY" : blkLane > 0 ? blkTag + " (screener row)" : "—", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : noC, text_size = size.small)
-    table.cell(tbl, 2, 9, horizon > 0 ? f_n(adsScore) : blkLane > 0 ? f_n(blkScr) : "0", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : color.red, text_size = size.small)
-    table.cell(tbl, 3, 9, horizon > 0 ? "DEPLOY" : blkLane > 0 ? "WAIT · " + blkWhy : "WAIT", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : noC, text_size = size.small)
+    table.cell(tbl, 0, 9, "WINNER", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 9, horizon > 0 ? horLabel + " " + stratLbl + " BUY" : blkLane > 0 ? blkTag + " (screener row)" : "—", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : noC, text_size = szLbl)
+    table.cell(tbl, 2, 9, horizon > 0 ? f_n(adsScore) : blkLane > 0 ? f_n(blkScr) : "0", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : color.red, text_size = szLbl)
+    table.cell(tbl, 3, 9, horizon > 0 ? "DEPLOY" : blkLane > 0 ? "WAIT · " + blkWhy : "WAIT", text_color = horizon > 0 ? okC : blkLane > 0 ? color.orange : noC, text_size = szLbl)
     // risk for the winner (or the best triggered lane when nothing deploys)
     rkLane = horizon > 0 ? horizon : grTrigO ? 3 : poEligO ? 2 : swTrigO ? 1 : 0
     rkStop = rkLane == 3 ? grStopO : rkLane == 2 ? poStopO : rkLane == 1 ? swStopO : na
     rkTp   = rkLane == 2 ? poTpO : rkLane == 1 ? swTpO : na
     rkRisk = rkLane == 3 ? grRiskO : rkLane == 2 ? poRiskO : rkLane == 1 ? swRiskO : na
     rkR    = rkLane == 2 ? poRO : rkLane == 1 ? swRO : na
-    table.cell(tbl, 0, 10, "Risk " + (rkLane > 0 ? f_laneName(rkLane) : ""), bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 10, rkLane > 0 ? "SL $" + str.tostring(rkStop, "0.##") + " (" + str.tostring(rkRisk, "0.#") + "%)" : "—", text_color = color.orange, text_size = size.tiny)
-    table.cell(tbl, 2, 10, rkLane == 3 ? "exit: close<200D" : rkLane > 0 ? "TP $" + str.tostring(rkTp, "0.##") : "—", text_color = okC, text_size = size.tiny)
-    table.cell(tbl, 3, 10, rkLane == 3 ? "room " + str.tostring(grRoomO, "0.#") + "% to 52W hi" : rkLane > 0 ? "R:R " + str.tostring(rkR, "0.0") : "—", text_color = rkLane == 3 ? wC : rkR >= 2.0 ? okC : rkR >= minRR ? color.yellow : color.red, text_size = size.tiny)
+    table.cell(tbl, 0, 10, "Risk " + (rkLane > 0 ? f_laneName(rkLane) : ""), bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 10, rkLane > 0 ? "SL $" + str.tostring(rkStop, "0.##") + " (" + str.tostring(rkRisk, "0.#") + "%)" : "—", text_color = color.orange, text_size = szVal)
+    table.cell(tbl, 2, 10, rkLane == 3 ? "exit: close<200D" : rkLane > 0 ? "TP $" + str.tostring(rkTp, "0.##") : "—", text_color = okC, text_size = szVal)
+    table.cell(tbl, 3, 10, rkLane == 3 ? "room " + str.tostring(grRoomO, "0.#") + "% to 52W hi" : rkLane > 0 ? "R:R " + str.tostring(rkR, "0.0") : "—", text_color = rkLane == 3 ? wC : rkR >= 2.0 ? okC : rkR >= minRR ? color.yellow : color.red, text_size = szVal)
     // reference position
-    table.cell(tbl, 0, 11, "Position (ref)", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 11, refLane > 0 ? "LONG @ " + str.tostring(refEntry, "0.##") + " · " + refTag : "FLAT", text_color = refLane > 0 ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 2, 11, refLane > 0 ? (refPnlPct >= 0 ? "+" : "") + str.tostring(refPnlPct, "0.##") + "%" : "", text_color = refPnlPct >= 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 11, refLane > 0 ? "SL " + str.tostring(refSL, "0.##") + (na(refTP) ? " · exit<200D" : " · TP " + str.tostring(refTP, "0.##")) + " · " + str.tostring(bar_index - refBar) + "b" : "", text_color = wC, text_size = size.tiny)
+    table.cell(tbl, 0, 11, "Position (ref)", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+    table.cell(tbl, 1, 11, refLane > 0 ? "LONG @ " + str.tostring(refEntry, "0.##") + " · " + refTag : "FLAT", text_color = refLane > 0 ? okC : noC, text_size = szVal)
+    table.cell(tbl, 2, 11, refLane > 0 ? (refPnlPct >= 0 ? "+" : "") + str.tostring(refPnlPct, "0.##") + "%" : "", text_color = refPnlPct >= 0 ? okC : color.red, text_size = szVal)
+    table.cell(tbl, 3, 11, refLane > 0 ? "SL " + str.tostring(refSL, "0.##") + (na(refTP) ? " · exit<200D" : " · TP " + str.tostring(refTP, "0.##")) + " · " + str.tostring(bar_index - refBar) + "b" : "", text_color = wC, text_size = szVal)
     // context
-    table.cell(tbl, 0, 12, "RSI", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 12, str.tostring(rsiO, "0.#"), text_color = rsiO < 30 ? okC : rsiO > 70 ? color.red : wC, text_size = size.small)
-    table.cell(tbl, 2, 12, "rVol=" + f_n(rvPctO) + "p", text_color = rvPctO > 70 ? okC : noC, text_size = size.tiny)
-    table.cell(tbl, 3, 12, "ATR=" + f_n(atrPctO) + "p", text_color = wC, text_size = size.tiny)
-    table.cell(tbl, 0, 13, "52wk", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 13, f_n(distLoO) + "% from low", text_color = distLoO > 80 ? okC : distLoO < 20 ? color.red : wC, text_size = size.tiny)
-    table.cell(tbl, 2, 13, "ROC20=" + str.tostring(roc20O, "0.#") + "%", text_color = roc20O > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 13, "ROC60=" + str.tostring(roc60O, "0.#") + "%", text_color = roc60O > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 14, "Market", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 14, "SPY regime " + f_n(mktO), text_color = mktO >= 1 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 2, 14, "RS 3M " + str.tostring(rs3mO, "0.#") + "% · 6M " + str.tostring(rs6mO, "0.#") + "%", text_color = rs3mO > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 14, "12-1 " + str.tostring(mom121O, "0.#") + "%", text_color = mom121O > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 15, "Fund / Earn", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 15, "rev " + str.tostring(revO, "0.#") + "% · eps " + str.tostring(epsO, "0.#") + "% · Q " + (na(epsG0O) ? "n/a" : (epsG0O >= 0 ? "+" : "") + str.tostring(epsG0O, "0") + "%") + " accel " + (na(epsAccelO) ? "-" : f_n(epsAccelO)), text_color = fundO ? wC : noC, text_size = size.tiny)
-    table.cell(tbl, 2, 15, earnKnownO ? "earnings " + f_n(dteO) + "d" : earnEstO ? "earnings ~" + f_n(dteO) + "d (est)" : "earnings n/a", text_color = (earnKnownO or earnEstO) and dteO <= 7 ? color.red : wC, text_size = size.tiny)
-    table.cell(tbl, 3, 15, "ADV $" + str.tostring(advO / 1000000.0, "0.#") + "M", text_color = liqO ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 16, "Sector / Breadth", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 16, secOkO ? secTag + " RS 3M " + (rsSecO >= 0 ? "+" : "") + str.tostring(rsSecO, "0.#") + "% · trend " + f_n(secTrendO) : "sector n/a", text_color = secOkO ? (rsSecO > 0 ? okC : color.red) : noC, text_size = size.tiny)
-    table.cell(tbl, 2, 16, breadthO ? "S&P above 50D " + f_n(s5fiO) + "% · 200D " + f_n(s5thO) + "%" : "breadth n/a", text_color = breadthO ? (s5thO >= 50 ? okC : color.red) : noC, text_size = size.tiny)
-    table.cell(tbl, 3, 16, na(revG0O) ? "rev Q n/a" : "rev Q " + (revG0O >= 0 ? "+" : "") + str.tostring(revG0O, "0") + "% accel " + (na(revAccelO) ? "-" : f_n(revAccelO)), text_color = na(revG0O) ? noC : revG0O > 0 ? okC : color.red, text_size = size.tiny)
-    table.cell(tbl, 0, 17, "Cooldown", bgcolor = hdrBg, text_color = wC, text_size = size.small)
-    table.cell(tbl, 1, 17, "SW " + (swCoolRem > 0 ? f_n(swCoolRem) + "b" : "READY") + " · POS " + (poCoolRem > 0 ? f_n(poCoolRem) + "b" : "READY") + " · GR " + (grCoolRem > 0 ? f_n(grCoolRem) + "b" : "READY"), text_color = swCoolRem + poCoolRem + grCoolRem > 0 ? color.orange : okC, text_size = size.tiny)
-    table.cell(tbl, 2, 17, (isDailyTF ? "1D ok" : "NOT 1D") + (warmO ? "" : " · WARMUP"), text_color = isDailyTF and warmO ? noC : color.red, text_size = size.tiny)
-    table.cell(tbl, 3, 17, "v2.2.0", text_color = noC, text_size = size.tiny)
+    // context rows (optional)
+    if showContext
+        table.cell(tbl, 0, 12, "RSI", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 12, str.tostring(rsiO, "0.#"), text_color = rsiO < 30 ? okC : rsiO > 70 ? color.red : wC, text_size = szLbl)
+        table.cell(tbl, 2, 12, "rVol=" + f_n(rvPctO) + "p", text_color = rvPctO > 70 ? okC : noC, text_size = szVal)
+        table.cell(tbl, 3, 12, "ATR=" + f_n(atrPctO) + "p", text_color = wC, text_size = szVal)
+        table.cell(tbl, 0, 13, "52wk", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 13, f_n(distLoO) + "% from low", text_color = distLoO > 80 ? okC : distLoO < 20 ? color.red : wC, text_size = szVal)
+        table.cell(tbl, 2, 13, "ROC20=" + str.tostring(roc20O, "0.#") + "%", text_color = roc20O > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 3, 13, "ROC60=" + str.tostring(roc60O, "0.#") + "%", text_color = roc60O > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 0, 14, "Market", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 14, "SPY regime " + f_n(mktO), text_color = mktO >= 1 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 2, 14, "RS 3M " + str.tostring(rs3mO, "0.#") + "% · 6M " + str.tostring(rs6mO, "0.#") + "%", text_color = rs3mO > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 3, 14, "12-1 " + str.tostring(mom121O, "0.#") + "%", text_color = mom121O > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 0, 15, "Fund / Earn", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 15, "rev " + str.tostring(revO, "0.#") + "% · eps " + str.tostring(epsO, "0.#") + "% · Q " + (na(epsG0O) ? "n/a" : (epsG0O >= 0 ? "+" : "") + str.tostring(epsG0O, "0") + "%") + " accel " + (na(epsAccelO) ? "-" : f_n(epsAccelO)), text_color = fundO ? wC : noC, text_size = szVal)
+        table.cell(tbl, 2, 15, earnKnownO ? "earnings " + f_n(dteO) + "d" : earnEstO ? "earnings ~" + f_n(dteO) + "d (est)" : "earnings n/a", text_color = (earnKnownO or earnEstO) and dteO <= 7 ? color.red : wC, text_size = szVal)
+        table.cell(tbl, 3, 15, "ADV $" + str.tostring(advO / 1000000.0, "0.#") + "M", text_color = liqO ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 0, 16, "Sector / Breadth", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        // v2.3.0: "~" = sector estimated from syminfo (chart only); UNKNOWN = not in the SPDR lists and no syminfo sector.
+        table.cell(tbl, 1, 16, secOkO ? secTag + " RS 3M " + (rsSecO >= 0 ? "+" : "") + str.tostring(rsSecO, "0.#") + "% · trend " + f_n(secTrendO) : secKnown ? secTag + " data n/a" : "sector UNKNOWN", text_color = secOkO ? (rsSecO > 0 ? okC : color.red) : noC, text_size = szVal)
+        table.cell(tbl, 2, 16, breadthO ? "S&P above 50D " + f_n(s5fiO) + "% · 200D " + f_n(s5thO) + "%" : "breadth n/a", text_color = breadthO ? (s5thO >= 50 ? okC : color.red) : noC, text_size = szVal)
+        table.cell(tbl, 3, 16, na(revG0O) ? "rev Q n/a" : "rev Q " + (revG0O >= 0 ? "+" : "") + str.tostring(revG0O, "0") + "% accel " + (na(revAccelO) ? "-" : f_n(revAccelO)), text_color = na(revG0O) ? noC : revG0O > 0 ? okC : color.red, text_size = szVal)
+        table.cell(tbl, 0, 17, "Cooldown", bgcolor = hdrBg, text_color = wC, text_size = szLbl)
+        table.cell(tbl, 1, 17, "SW " + (swCoolRem > 0 ? f_n(swCoolRem) + "b" : "READY") + " · POS " + (poCoolRem > 0 ? f_n(poCoolRem) + "b" : "READY") + " · GR " + (grCoolRem > 0 ? f_n(grCoolRem) + "b" : "READY"), text_color = swCoolRem + poCoolRem + grCoolRem > 0 ? color.orange : okC, text_size = szVal)
+        table.cell(tbl, 2, 17, (isDailyTF ? "1D ok" : "NOT 1D") + (warmO ? "" : " · WARMUP"), text_color = isDailyTF and warmO ? noC : color.red, text_size = szVal)
+        table.cell(tbl, 3, 17, "v2.3.0" + (sw_structOn ? " · struct gate" : ""), text_color = noC, text_size = szVal)

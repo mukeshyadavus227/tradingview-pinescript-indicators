@@ -21,12 +21,16 @@ EXITS_V3 = {1: M["M5_chand3_only"], 2: M["M0_current"], 3: M["M8_partial_chand3_
 SPLIT = pd.Timestamp("2021-01-01")
 
 
-def simulate_symbol(sym, bars, profile, params, exits, fill="close", mintick=None):
+def simulate_symbol(sym, bars, profile, params, exits, fill="close", mintick=None, post=None):
     """fill="close": entry at the signal close (harness convention, not executable live).
     fill="next_open": entry at the next session's open against the engine's absolute stop — the
     fill a daily-close webhook can actually get (Phase 6).
-    mintick: forwarded to the labeller (tick-rounded chandelier, as the Pine); parity_test passes it."""
+    mintick: forwarded to the labeller (tick-rounded chandelier, as the Pine); parity_test passes it.
+    post: optional f(engine_frame, bars) -> engine_frame applied before trade generation, e.g. an
+    extra eligibility gate (ads2_structure_gate.py). None (default) leaves every result unchanged."""
     d = run_engine(bars, profile, params)
+    if post is not None:
+        d = post(d, bars)
     o, h, l, c = (bars[k].values.astype(float) for k in "ohlc")
     atr, tm = d.atr.values, bars.t.values.astype(np.int64) * 1000
     trades, busy_until = [], -1
